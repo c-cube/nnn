@@ -6,6 +6,7 @@ mod profile;
 mod sanitize;
 
 use clap::Parser;
+use std::convert::Infallible;
 use std::ffi::CString;
 use std::path::PathBuf;
 
@@ -80,7 +81,7 @@ fn main() {
     };
     cfg = config::merge(&cfg, &cli_overlay);
 
-    log::debug!("resolved config: {cfg:#?}");
+    log::info!("resolved config: {cfg:#?}");
 
     // Check command against deny list
     if let Err(msg) = command::check(&cli.command, &cfg.command, cli.warn) {
@@ -98,7 +99,7 @@ fn main() {
     }
 
     // Exec the command
-    exec_command(&cli.command, &env);
+    let _ = exec_command(&cli.command, &env);
 }
 
 fn resolve_config(cli: &Cli) -> config::Config {
@@ -131,7 +132,7 @@ fn resolve_config(cli: &Cli) -> config::Config {
     config::Config::default()
 }
 
-fn exec_command(command: &[String], env: &[(String, String)]) -> ! {
+fn exec_command(command: &[String], env: &[(String, String)]) -> Infallible {
     let program = CString::new(command[0].as_str()).expect("invalid command name");
     let args: Vec<CString> = command
         .iter()
@@ -143,6 +144,5 @@ fn exec_command(command: &[String], env: &[(String, String)]) -> ! {
         .collect();
 
     log::debug!("exec: {:?}", command);
-    nix::unistd::execvpe(&program, &args, &env_cstrings).expect("execvpe failed");
-    unreachable!()
+    nix::unistd::execvpe(&program, &args, &env_cstrings).expect("execvpe failed")
 }

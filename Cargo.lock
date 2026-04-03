@@ -273,6 +273,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nounours"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "glob",
+ "landlock",
+ "log",
+ "miniz_oxide",
+ "nix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -381,21 +396,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "smolsandbox"
-version = "0.1.0"
-dependencies = [
- "clap",
- "env_logger",
- "glob",
- "landlock",
- "log",
- "miniz_oxide",
- "nix",
- "serde",
- "serde_json",
 ]
 
 [[package]]

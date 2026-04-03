@@ -2,7 +2,7 @@
 pub fn hardened_env() -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> =
         std::env::vars().filter(|(k, _)| !is_dangerous(k)).collect();
-    env.push(("SMOLSANDBOX".to_string(), "1".to_string()));
+    env.push(("NOUNOURS".to_string(), "1".to_string()));
     env
 }
 
