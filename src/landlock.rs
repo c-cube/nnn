@@ -31,7 +31,7 @@ const SYSTEM_READ_PATHS: &[&str] = &[
 /// Note: /dev/stdout and /dev/stderr are symlinks to /proc/self/fd/* and can't
 /// be added as Landlock rules. /dev is already readable, and /proc is readable,
 /// so they work through the existing rules.
-const SYSTEM_WRITE_PATHS: &[&str] = &["/dev/null", "/dev/tty", "/tmp"];
+const SYSTEM_WRITE_PATHS: &[&str] = &["/dev/null", "/dev/tty", "/tmp", "/var/tmp"];
 
 /// Paths readable in deny-by-default mode (tooling runtimes).
 /// These version managers need read access to their full directories.
