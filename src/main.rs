@@ -1,6 +1,9 @@
+#![deny(unsafe_code)]
+#![deny(clippy::panic)]
+
+use anyhow::{Context, bail};
 use landlock::{
-    make_bitflags, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
-    ABI,
+    make_bitflags, Access, AccessFs, PathBeneath, PathFd, Ruleset, ABI,
 };
 use std::path::{Path, PathBuf};
 
@@ -112,7 +115,7 @@ struct AddArgs {
 fn main() {
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         Command::Exec(args) => cmd_exec(args),
         Command::AddRo(args) => cmd_add_path(&args.dir, false, args.global),
         Command::AddRw(args) => cmd_add_path(&args.dir, true, args.global),
@@ -121,21 +124,23 @@ fn main() {
             eprintln!("nnn: expected a command to run");
             std::process::exit(1);
         }
-        Command::Other(args) => {
-            let exec_args = ExecArgs {
-                no_auto_cwd: false,
-                allow_read: Vec::new(),
-                allow_write: Vec::new(),
-                project_config: None,
-                command: args,
-            };
-            cmd_exec(exec_args);
-        }
+        Command::Other(args) => cmd_exec(ExecArgs {
+            no_auto_cwd: false,
+            allow_read: Vec::new(),
+            allow_write: Vec::new(),
+            project_config: None,
+            command: args,
+        }),
         Command::Init => cmd_init(),
+    };
+
+    if let Err(e) = result {
+        eprintln!("nnn: {e:#}");
+        std::process::exit(1);
     }
 }
 
-fn cmd_exec(args: ExecArgs) {
+fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let mut cfg = resolve_config(args.project_config.as_deref());
@@ -144,16 +149,10 @@ fn cmd_exec(args: ExecArgs) {
     if let Ok(extra) = std::env::var("NNN_CONFIG") {
         let path = Path::new(&extra);
         if path.is_file() {
-            match load_toml_file(path) {
-                Ok(extra_cfg) => {
-                    log::info!("loaded NNN_CONFIG from {}", path.display());
-                    cfg = cfg.merge(&extra_cfg);
-                }
-                Err(e) => {
-                    eprintln!("nnn: NNN_CONFIG: {e}");
-                    std::process::exit(1);
-                }
-            }
+            let extra_cfg = load_toml_file(path)
+                .with_context(|| format!("loading NNN_CONFIG from {}", path.display()))?;
+            log::info!("loaded NNN_CONFIG from {}", path.display());
+            cfg = cfg.merge(&extra_cfg);
         } else {
             log::warn!("NNN_CONFIG path not found: {}", path.display());
         }
@@ -177,14 +176,10 @@ fn cmd_exec(args: ExecArgs) {
 
     let env = hardened_env();
 
-    if let Err(e) = landlock_apply(&cfg, !args.no_auto_cwd) {
-        eprintln!("nnn: landlock: {e}");
-        std::process::exit(1);
-    }
+    landlock_apply(&cfg, !args.no_auto_cwd)?;
 
     let err = exec_command(&args.command, &env);
-    eprintln!("nnn: exec failed: {err}");
-    std::process::exit(1);
+    Err(anyhow::anyhow!("exec failed: {err}"))
 }
 
 fn cmd_add_path(dir: &str, write: bool, global: bool) {
@@ -211,7 +206,7 @@ fn cmd_add_path(dir: &str, write: bool, global: bool) {
 
     let key = if write { "allow-write" } else { "allow-read" };
 
-    if !doc.contains_table(key) {
+    if !doc.get(key).and_then(|item| item.as_array()).is_some() {
         doc[key] = toml_edit::value(toml_edit::Array::new());
     }
 
@@ -494,51 +489,56 @@ fn landlock_access_write(abi: ABI) -> landlock::BitFlags<AccessFs> {
     flags
 }
 
-fn landlock_apply(config: &Config, auto_cwd: bool) -> Result<(), String> {
+fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
     let abi = ABI::V5;
 
     let fs_access = AccessFs::from_all(abi);
     if fs_access.is_empty() {
-        log::warn!("landlock: not supported on this kernel, skipping");
-        return Ok(());
+        log::error!("landlock: not supported on this kernel");
+        anyhow::bail!("landlock not supported on this kernel");
     }
 
     let ruleset = Ruleset::default()
         .handle_access(fs_access)
-        .map_err(|e| format!("creating ruleset: {e}"))?;
+        .context("creating ruleset")?;
 
-    let mut ruleset = ruleset
-        .create()
-        .map_err(|e| format!("creating ruleset: {e}"))?;
+    let mut ruleset = ruleset.create().context("creating ruleset")?;
 
     for path in SYSTEM_READ_PATHS {
-        ruleset = landlock_add_rule(ruleset, path, landlock_access_read());
+        ruleset = landlock_add_rule(ruleset, path, landlock_access_read())
+            .with_context(|| format!("adding read rule for {path}"))?;
     }
 
     for path in SYSTEM_WRITE_PATHS {
-        ruleset = landlock_add_rule(ruleset, path, landlock_access_write(abi));
+        ruleset = landlock_add_rule(ruleset, path, landlock_access_write(abi))
+            .with_context(|| format!("adding write rule for {path}"))?;
     }
 
     if auto_cwd {
         if let Ok(cwd) = std::env::current_dir() {
             let cwd_str = cwd.to_string_lossy().to_string();
-            ruleset = landlock_add_rule(ruleset, &cwd_str, landlock_access_write(abi));
+            ruleset = landlock_add_rule(ruleset, &cwd_str, landlock_access_write(abi))
+                .context("adding cwd rule")?;
         }
     }
 
     for p in &config.allow_read {
         let expanded = expand_tilde(p);
-        ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_read());
+        let canonical = std::fs::canonicalize(&expanded).unwrap_or(PathBuf::from(&expanded));
+        let resolved = canonical.to_string_lossy().to_string();
+        ruleset = landlock_add_rule(ruleset, &resolved, landlock_access_read())
+            .with_context(|| format!("adding read rule for {p}"))?;
     }
 
     for p in &config.allow_write {
         let expanded = expand_tilde(p);
-        ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_write(abi));
+        let canonical = std::fs::canonicalize(&expanded).unwrap_or(PathBuf::from(&expanded));
+        let resolved = canonical.to_string_lossy().to_string();
+        ruleset = landlock_add_rule(ruleset, &resolved, landlock_access_write(abi))
+            .with_context(|| format!("adding write rule for {p}"))?;
     }
 
-    ruleset
-        .restrict_self()
-        .map_err(|e| format!("restrict_self: {e}"))?;
+    ruleset.restrict_self().context("restrict_self")?;
 
     log::info!("landlock: restrictions applied");
     Ok(())
@@ -548,11 +548,11 @@ fn landlock_add_rule(
     ruleset: landlock::RulesetCreated,
     path: &str,
     access: landlock::BitFlags<AccessFs>,
-) -> landlock::RulesetCreated {
+) -> anyhow::Result<landlock::RulesetCreated> {
     let p = Path::new(path);
     if !p.exists() {
         log::debug!("landlock: skipping non-existent path: {path}");
-        return ruleset;
+        return Ok(ruleset);
     }
 
     if p.is_symlink() {
@@ -560,33 +560,27 @@ fn landlock_add_rule(
             let ts = target.to_string_lossy();
             if ts.starts_with("/proc/self/fd") || ts.starts_with("/proc/") {
                 log::debug!("landlock: skipping proc symlink: {path} -> {ts}");
-                return ruleset;
+                return Ok(ruleset);
             }
         }
     }
 
-    match PathFd::new(path) {
-        Ok(fd) => {
-            let rule = PathBeneath::new(fd, access);
-            match ruleset.add_rule(rule) {
-                Ok(rs) => {
-                    let mode = if access.contains(AccessFs::WriteFile) {
-                        "rw"
-                    } else {
-                        "ro"
-                    };
-                    log::debug!("landlock: allow {mode} {path}");
-                    rs
-                }
-                Err(e) => {
-                    log::error!("landlock: fatal: add_rule failed for {path}: {e}");
-                    panic!("landlock: add_rule failed for {path}: {e}");
-                }
-            }
+    let fd = PathFd::new(path)
+        .with_context(|| format!("opening {path} for Landlock rule"))?;
+    let rule = PathBeneath::new(fd, access);
+
+    match ruleset.add_rule(rule) {
+        Ok(rs) => {
+            let mode = if access.contains(AccessFs::WriteFile) {
+                "rw"
+            } else {
+                "ro"
+            };
+            log::debug!("landlock: allow {mode} {path}");
+            Ok(rs)
         }
         Err(e) => {
-            log::debug!("landlock: failed to open {path}: {e}");
-            ruleset
+            bail!("add_rule failed for {path}: {e}")
         }
     }
 }

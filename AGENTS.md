@@ -5,7 +5,7 @@ whitelisted directories. Nothing else.
 
 ## Design Goals
 
-- **Minimal surface.** One file (`src/main.rs`, ~500 lines). Six dependencies.
+- **Minimal surface.** One file (`src/main.rs`, ~590 lines). Six dependencies.
   No profiles, deny lists, network filtering, or any feature that isn't
   "whitelist directories for this process."
 - **Config is just paths.** Global config (`~/.config/nnn/config.toml`) sets
@@ -24,16 +24,20 @@ whitelisted directories. Nothing else.
 
 | Dependency | Why |
 |---|---|
-| `clap` | CLI parsing (derive API, subcommands) |
+| `anyhow` | Error handling with context (no panics) |
+| `clap` | CLI parsing (derive API, subcommands, external_subcommand) |
 | `env_logger` + `log` | Diagnostic logging (warn mode) |
 | `serde` | TOML deserialization (Raw struct in `load_toml_file`) |
 | `toml_edit` | Reading + editing `.nnn.toml` (format-preserving) |
 | `landlock` | Landlock ABI bindings |
 
-The only non-obvious dependency is `toml_edit` — it's used for both
-deserialization and programmatic editing (`add-ro`/`add-rw` insert paths
-without reformatting the file). `serde` with `derive` feature is used only
-for the internal `Raw` struct in `load_toml_file`.
+`toml_edit` is used for both deserialization and programmatic editing
+(`add-ro`/`add-rw` insert paths without reformatting). `serde` with `derive`
+is used only for the internal `Raw` struct in `load_toml_file`.
+
+The `Config` struct is local (not serde-deserialized directly from TOML) —
+a separate `Raw` struct with `#[serde(rename_all = "kebab-case")]` bridges
+the kebab-case TOML keys into the code.
 
 Everything else is stdlib: `std::os::unix::process::CommandExt::exec` for
 process replacement, `std::path` for path handling, `std::env` for env
@@ -58,18 +62,25 @@ nnn show                         # Show resolved rules for this directory
 nnn init                         # Write default global config
 ```
 
+Bare `nnn <command>` (no subcommand) is caught by `#[command(external_subcommand)]`
+on the `Other` variant and treated as `nnn exec -- <command>` with defaults.
+
 ### `nnn exec`
 
 ```sh
 nnn exec -- cargo build
 nnn exec --allow-read ./extra -- ./my-script
+nnn exec --no-auto-cwd -- curl example.com   # Don't auto-allow rw on cwd
+nnn x -- cargo build                          # alias
 ```
 
 Config resolution order (each later step appends and deduplicates):
 
 1. Global config: `$XDG_CONFIG_HOME/nnn/config.toml` (or `~/.config/nnn/config.toml`)
 2. Project config: `.nnn.toml` found by walking up from cwd
-3. CLI flags: `--allow-read` / `--allow-write`
+3. `NNN_CONFIG` env: path to an additional TOML file (loaded after project config)
+4. `NNN_RO` / `NNN_RW` env: comma-separated paths (loaded before CLI flags)
+5. CLI flags: `--allow-read` / `--allow-write`
 
 Global config is optional — if it doesn't exist, only system default paths
 are allowed. Project config is optional — if no `.nnn.toml` is found, only
@@ -82,6 +93,7 @@ cd my-project
 nnn add-ro ./src          # creates .nnn.toml in git root (or cwd)
 nnn add-rw ./output       # appends to existing .nnn.toml
 nnn add-ro ./src          # no-op (already present)
+nnn add-ro -g ~/.git      # modify global config instead of project
 ```
 
 Uses `toml_edit::DocumentMut` to edit `.nnn.toml` in place — preserves
@@ -94,27 +106,25 @@ Prints the global config path, project config path, and the merged result:
 
 ```
 Global config: /home/user/.config/nnn/config.toml
-  allow-read:
-    /usr
-    /lib
-  allow-write:
-    /tmp
+  allow-read: /usr, /lib
+  allow-write: /tmp
 
 Project config: /home/user/project/.nnn.toml
-  allow-read:
-    ./src
-  allow-write:
-    ./output
+  allow-read: ./src
+  allow-write: ./output
 
 Resolved (merged):
-  allow-read:
-    /usr
-    /lib
-    ./src
-  allow-write:
-    /tmp
-    ./output
+  allow-read: /usr, /lib, ./src
+  allow-write: /tmp, ./output
 ```
+
+### `nnn init`
+
+Writes a default config to `~/.config/nnn/config.toml` with sensible system
+paths. Refuses to overwrite an existing file. Default config includes:
+
+- `allow-read`: `/bin/`, `/usr/bin/`, `/usr/local/bin`, `~/.cargo/bin`, `~/.config/nnn`
+- `allow-write`: `/tmp/nnn/`
 
 ## Environment Sanitization
 
@@ -122,10 +132,29 @@ Before exec, nnn strips `LD_*` and `DYLD_*` environment variables
 (library injection vectors). It injects `NNN=1` so the sandboxed process
 can detect it's running under nnn.
 
+The sandboxed environment starts from the current process env (minus
+dangerous vars), then `env_clear()` + selective re-add via `exec_command`.
+This means the child process only sees what nnn's own process sees.
+
+## Default Landlock Rules
+
+**Read-only** (`/usr`, `/lib`, `/lib64`, `/lib32`, `/bin`, `/sbin`, `/etc`,
+`/proc`, `/sys`, `/run`, `/var`, `/opt`, `/dev`, `/tmp`)
+
+**Read-write** (`/dev/null`, `/dev/tty`, `/tmp`, `/var/tmp`)
+
+Additionally, if `--no-auto-cwd` is not set, the current working directory
+gets read-write access.
+
+Paths from config (`~` expanded) are added as read-only or read-write rules.
+
+**Note:** `/dev/stdout` and `/dev/stderr` are symlinks to `/proc/self/fd/*`
+and are silently skipped — they work through the existing `/dev` and `/proc`
+read rules.
+
 ## CI
 
-Simple Rust CI — `cargo build && cargo test`. No matrix, no platforms,
-no containers.
+Rust CI — `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test`.
 
 ## Known Issues
 
@@ -135,3 +164,7 @@ no containers.
   silently skipped — Landlock rejects path references pointing into proc.
 - Landlock cannot deny reads within an allowed directory tree (the kernel
   limitation, not nnn's).
+- `ABI::V5` is hardcoded — may fail on kernels < 5.19. No runtime ABI
+  detection or fallback.
+- No network sandboxing — Landlock ABI V4+ can restrict TCP connect,
+  but nnn doesn't restrict any network access.
