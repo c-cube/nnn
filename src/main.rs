@@ -1,56 +1,32 @@
-mod command;
 mod config;
 mod landlock;
 mod paths;
-mod profile;
 mod sanitize;
 
 use clap::Parser;
-use std::convert::Infallible;
-use std::ffi::CString;
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "smolsandbox", about = "Minimal Linux sandbox using Landlock")]
 struct Cli {
-    /// Path to JSON profile file (overrides auto-detection)
-    #[arg(short, long)]
-    profile: Option<PathBuf>,
-
-    /// Don't auto-detect profile from command name
-    #[arg(long)]
-    no_default_profile: bool,
-
     /// Log violations as warnings instead of blocking
     #[arg(short, long)]
     warn: bool,
 
-    /// Additional read-allowed paths
+    /// Additional read-allowed paths (appended to config)
     #[arg(long)]
     allow_read: Vec<String>,
 
-    /// Additional write-allowed paths
+    /// Additional write-allowed paths (appended to config)
     #[arg(long)]
     allow_write: Vec<String>,
 
-    /// Additional read-denied paths
+    /// Path to project .nounours.toml (auto-detected from git root)
     #[arg(long)]
-    deny_read: Vec<String>,
-
-    /// Additional denied commands
-    #[arg(long)]
-    deny_cmd: Vec<String>,
-
-    /// TCP ports allowed for outbound connect (Landlock ABI V4+)
-    #[arg(long)]
-    allow_port: Vec<u16>,
-
-    /// List available built-in profiles and exit
-    #[arg(long)]
-    list_profiles: bool,
+    project_config: Option<PathBuf>,
 
     /// Command to run inside the sandbox
-    #[arg(last = true, required_unless_present = "list_profiles")]
+    #[arg(last = true, required = true)]
     command: Vec<String>,
 }
 
@@ -58,54 +34,55 @@ fn main() {
     let cli = Cli::parse();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    if cli.list_profiles {
-        profile::list_profiles();
-        return;
-    }
-
-    // Resolve profile
+    // Resolve config: global (xdg) + project (.nounours.toml) + CLI
     let mut cfg = resolve_config(&cli);
 
-    // Merge CLI overrides
-    let cli_overlay = config::Config {
-        filesystem: config::FilesystemConfig {
-            allow_read: cli.allow_read,
-            allow_write: cli.allow_write,
-            deny_read: cli.deny_read,
-            ..Default::default()
-        },
-        command: config::CommandConfig {
-            deny: cli.deny_cmd,
-            ..Default::default()
-        },
-    };
-    cfg = config::merge(&cfg, &cli_overlay);
+    // Merge CLI overrides into allow_read / allow_write
+    for p in &cli.allow_read {
+        if !cfg.allow_read.contains(p) {
+            cfg.allow_read.push(p.clone());
+        }
+    }
+    for p in &cli.allow_write {
+        if !cfg.allow_write.contains(p) {
+            cfg.allow_write.push(p.clone());
+        }
+    }
 
     log::info!("resolved config: {cfg:#?}");
-
-    // Check command against deny list
-    if let Err(msg) = command::check(&cli.command, &cfg.command, cli.warn) {
-        eprintln!("smolsandbox: {msg}");
-        std::process::exit(1);
-    }
 
     // Sanitize environment
     let env = sanitize::hardened_env();
 
     // Apply Landlock
-    if let Err(e) = landlock::apply(&cfg, &cli.allow_port, cli.warn) {
+    if let Err(e) = landlock::apply(&cfg, cli.warn) {
         eprintln!("smolsandbox: landlock: {e}");
         std::process::exit(1);
     }
 
     // Exec the command
-    let _ = exec_command(&cli.command, &env);
+    let err = exec_command(&cli.command, &env);
+    eprintln!("smolsandbox: exec failed: {err}");
+    std::process::exit(1);
 }
 
 fn resolve_config(cli: &Cli) -> config::Config {
-    if let Some(ref path) = cli.profile {
-        match config::load_file(path) {
-            Ok(cfg) => return cfg,
+    // 1. Global config from XDG
+    let global_cfg = load_global_config();
+
+    // 2. Project config from cli arg or git root
+    let project_path = cli
+        .project_config
+        .clone()
+        .or_else(find_project_config);
+
+    let mut cfg = global_cfg;
+    if let Some(path) = project_path {
+        match load_toml_file(&path) {
+            Ok(project_cfg) => {
+                log::info!("loaded project config from {}", path.display());
+                cfg = cfg.merge(&project_cfg);
+            }
             Err(e) => {
                 eprintln!("smolsandbox: {e}");
                 std::process::exit(1);
@@ -113,36 +90,65 @@ fn resolve_config(cli: &Cli) -> config::Config {
         }
     }
 
-    if cli.no_default_profile {
-        return config::Config::default();
-    }
+    cfg
+}
 
-    // Auto-detect from command basename
-    if let Some(cmd) = cli.command.first() {
-        let basename = std::path::Path::new(cmd)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(cmd);
-        if let Some(cfg) = profile::find(basename) {
-            log::info!("auto-detected profile for {basename:?}");
-            return cfg;
+fn load_global_config() -> config::Config {
+    let config_dir = dirs_config_dir().unwrap_or_else(|| PathBuf::from("~/.config"));
+    let path = config_dir.join("nounours").join("config.toml");
+    if path.exists() {
+        match load_toml_file(&path) {
+            Ok(cfg) => {
+                log::info!("loaded global config from {}", path.display());
+                return cfg;
+            }
+            Err(e) => {
+                eprintln!("smolsandbox: {e}");
+                std::process::exit(1);
+            }
         }
     }
-
     config::Config::default()
 }
 
-fn exec_command(command: &[String], env: &[(String, String)]) -> Infallible {
-    let program = CString::new(command[0].as_str()).expect("invalid command name");
-    let args: Vec<CString> = command
-        .iter()
-        .map(|a| CString::new(a.as_str()).expect("invalid argument"))
-        .collect();
-    let env_cstrings: Vec<CString> = env
-        .iter()
-        .map(|(k, v)| CString::new(format!("{k}={v}")).unwrap())
-        .collect();
+fn find_project_config() -> Option<PathBuf> {
+    // Walk up from cwd looking for .nounours.toml
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join(".nounours.toml");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
 
-    log::debug!("exec: {:?}", command);
-    nix::unistd::execvpe(&program, &args, &env_cstrings).expect("execvpe failed")
+fn load_toml_file(path: &std::path::Path) -> Result<config::Config, String> {
+    let data =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    toml_edit::de::from_str(&data)
+        .map_err(|e| format!("parsing {}: {e}", path.display()))
+}
+
+fn dirs_config_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))
+}
+
+fn exec_command(command: &[String], env: &[(String, String)]) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(&command[0]);
+    cmd.args(&command[1..]);
+    cmd.env_clear();
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    // Replace current process (sandbox one-shot)
+    cmd.exec()
 }

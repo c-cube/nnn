@@ -1,3 +1,0 @@
-[submodule "vendor/greywall"]
-	path = vendor/greywall
-	url = https://github.com/greyhavenhq/greywall.git
