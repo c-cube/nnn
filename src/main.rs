@@ -40,6 +40,10 @@ const DEFAULT_CONFIG: &str = concat!(
     "    \"~/.cargo/bin\",\n",
     "    \"~/.config/nnn\",\n",
     "]\n",
+    "\n",
+    "allow-write = [\n",
+    "    \"/tmp/nnn/\",\n",
+    "]\n",
 );
 
 // ── CLI ──
