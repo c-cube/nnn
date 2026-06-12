@@ -9,6 +9,9 @@ release:
 install:
 	cargo install --path=.
 
+format:
+	cargo fmt
+
 test:
 	cargo test
 

@@ -1,6 +1,6 @@
 use landlock::{
-    make_bitflags, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, ABI,
+    make_bitflags, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+    ABI,
 };
 use std::path::{Path, PathBuf};
 
@@ -136,12 +136,31 @@ fn main() {
 }
 
 fn cmd_exec(args: ExecArgs) {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn"),
-    )
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let mut cfg = resolve_config(args.project_config.as_deref());
+
+    // NNN_CONFIG: additional config file
+    if let Ok(extra) = std::env::var("NNN_CONFIG") {
+        let path = Path::new(&extra);
+        if path.is_file() {
+            match load_toml_file(path) {
+                Ok(extra_cfg) => {
+                    log::info!("loaded NNN_CONFIG from {}", path.display());
+                    cfg = cfg.merge(&extra_cfg);
+                }
+                Err(e) => {
+                    eprintln!("nnn: NNN_CONFIG: {e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            log::warn!("NNN_CONFIG path not found: {}", path.display());
+        }
+    }
+
+    // NNN_RO/NNN_RW: comma-separated (before CLI flags)
+    cfg = cfg.merge(&env_overrides());
 
     for p in &args.allow_read {
         if !cfg.allow_read.contains(p) {
@@ -173,9 +192,8 @@ fn cmd_add_path(dir: &str, write: bool, global: bool) {
         global_config_path()
     } else {
         find_project_config().unwrap_or_else(|| {
-            let root = find_git_root().unwrap_or_else(|| {
-                std::env::current_dir().expect("cwd available")
-            });
+            let root =
+                find_git_root().unwrap_or_else(|| std::env::current_dir().expect("cwd available"));
             root.join(".nnn.toml")
         })
     };
@@ -285,6 +303,28 @@ fn print_paths(label: &str, paths: &[String]) {
 }
 
 // ── Config resolution ──
+
+/// Parse comma-separated env vars NNN_RO and NNN_RW.
+fn env_overrides() -> Config {
+    let mut cfg = Config::default();
+    if let Ok(val) = std::env::var("NNN_RO") {
+        for p in val.split(',') {
+            let p = p.trim().to_string();
+            if !p.is_empty() && !cfg.allow_read.contains(&p) {
+                cfg.allow_read.push(p);
+            }
+        }
+    }
+    if let Ok(val) = std::env::var("NNN_RW") {
+        for p in val.split(',') {
+            let p = p.trim().to_string();
+            if !p.is_empty() && !cfg.allow_write.contains(&p) {
+                cfg.allow_write.push(p);
+            }
+        }
+    }
+    cfg
+}
 
 fn resolve_config(explicit_project: Option<&Path>) -> Config {
     let global_cfg = load_global_config();
@@ -431,8 +471,8 @@ fn expand_tilde(s: &str) -> String {
 // ── Landlock ──
 
 const SYSTEM_READ_PATHS: &[&str] = &[
-    "/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc", "/proc",
-    "/sys", "/run", "/var", "/opt", "/dev", "/tmp",
+    "/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc", "/proc", "/sys", "/run", "/var",
+    "/opt", "/dev", "/tmp",
 ];
 
 const SYSTEM_WRITE_PATHS: &[&str] = &["/dev/null", "/dev/tty", "/tmp", "/var/tmp"];

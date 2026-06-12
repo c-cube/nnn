@@ -3,6 +3,9 @@
 
 Minimal Linux sandbox using Landlock. Restricts a process to only access whitelisted directories.
 
+The goal is to make sandboxing both very low friction (have per-project config,
+an easy CLI) and easy to audit (tiny codebase + dependency cone).
+
 ```sh
 nnn exec -- cargo build          # Run sandboxed
 nnn add-ro ./src                 # Add read-only path to project config
@@ -14,4 +17,12 @@ nnn init                         # Write default global config
 
 Config: global (`~/.config/nnn/config.toml`) + project (`.nnn.toml` in git root). Both are just `allow-read` and `allow-write` arrays. Merged at runtime. CLI `--allow-read`/`--allow-write` add on top.
 
-Landlock is the only primitive — no seccomp, no containers, no capabilities. Requires Linux ≥ 5.13.
+Environment variables (`NNN_RO`, `NNN_RW` — comma-separated paths) are loaded before CLI flags. `NNN_CONFIG` loads an additional TOML file after project config. Compatible with [direnv](https://direnv.net/):
+
+```env
+# .envrc
+export NNN_RO="$HOME/src"
+export NNN_RW="$HOME/output"
+```
+
+Landlock is the only primitive. Network is not restricted. Requires Linux ≥ 5.13.
