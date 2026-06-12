@@ -9,7 +9,6 @@ use toml_edit::DocumentMut;
 
 // ── Config ──
 
-/// Filesystem paths to allow — loaded from TOML config.
 #[derive(Debug, Default, Clone)]
 struct Config {
     allow_read: Vec<String>,
@@ -17,7 +16,6 @@ struct Config {
 }
 
 impl Config {
-    /// Merge another config on top (project overrides global).
     fn merge(&self, overlay: &Config) -> Config {
         let mut c = self.clone();
         for p in &overlay.allow_read {
@@ -34,6 +32,16 @@ impl Config {
     }
 }
 
+const DEFAULT_CONFIG: &str = concat!(
+    "allow-read = [\n",
+    "    \"/bin/\",\n",
+    "    \"/usr/bin/\",\n",
+    "    \"/usr/local/bin\",\n",
+    "    \"~/.cargo/bin\",\n",
+    "    \"~/.config/nnn\",\n",
+    "]\n",
+);
+
 // ── CLI ──
 
 #[derive(Parser)]
@@ -46,7 +54,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a command inside the sandbox
-    Run(RunArgs),
+    #[command(alias = "x", name = "exec")]
+    Exec(ExecArgs),
     /// Add a read-only path to the project config
     #[command(name = "add-ro")]
     AddRo(AddArgs),
@@ -55,13 +64,17 @@ enum Command {
     AddRw(AddArgs),
     /// Show resolved rules for the current directory
     Show,
+    /// Write default global config to ~/.config/nnn/config.toml
+    Init,
+    #[command(external_subcommand)]
+    Other(Vec<String>),
 }
 
 #[derive(Parser)]
-struct RunArgs {
-    /// Log violations as warnings instead of blocking
-    #[arg(short, long)]
-    warn: bool,
+struct ExecArgs {
+    /// Don't automatically allow read-write access to cwd
+    #[arg(long)]
+    no_auto_cwd: bool,
 
     /// Additional read-allowed paths (appended to config)
     #[arg(long)]
@@ -76,12 +89,16 @@ struct RunArgs {
     project_config: Option<PathBuf>,
 
     /// Command to run inside the sandbox
-    #[arg(last = true, required = true)]
+    #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
 }
 
 #[derive(Parser)]
 struct AddArgs {
+    /// Modify the global config instead of project config
+    #[arg(short, long)]
+    global: bool,
+
     /// Directory path to add
     dir: String,
 }
@@ -92,15 +109,33 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run(args) => cmd_run(args),
-        Command::AddRo(args) => cmd_add_path(&args.dir, false),
-        Command::AddRw(args) => cmd_add_path(&args.dir, true),
+        Command::Exec(args) => cmd_exec(args),
+        Command::AddRo(args) => cmd_add_path(&args.dir, false, args.global),
+        Command::AddRw(args) => cmd_add_path(&args.dir, true, args.global),
         Command::Show => cmd_show(),
+        Command::Other(args) if args.is_empty() => {
+            eprintln!("nnn: expected a command to run");
+            std::process::exit(1);
+        }
+        Command::Other(args) => {
+            let exec_args = ExecArgs {
+                no_auto_cwd: false,
+                allow_read: Vec::new(),
+                allow_write: Vec::new(),
+                project_config: None,
+                command: args,
+            };
+            cmd_exec(exec_args);
+        }
+        Command::Init => cmd_init(),
     }
 }
 
-fn cmd_run(args: RunArgs) {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+fn cmd_exec(args: ExecArgs) {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn"),
+    )
+    .init();
 
     let mut cfg = resolve_config(args.project_config.as_deref());
 
@@ -119,7 +154,7 @@ fn cmd_run(args: RunArgs) {
 
     let env = hardened_env();
 
-    if let Err(e) = landlock_apply(&cfg, args.warn) {
+    if let Err(e) = landlock_apply(&cfg, !args.no_auto_cwd) {
         eprintln!("nnn: landlock: {e}");
         std::process::exit(1);
     }
@@ -129,13 +164,17 @@ fn cmd_run(args: RunArgs) {
     std::process::exit(1);
 }
 
-fn cmd_add_path(dir: &str, write: bool) {
-    let project_path = find_project_config().unwrap_or_else(|| {
-        let root = find_git_root().unwrap_or_else(|| {
-            std::env::current_dir().expect("cwd available")
-        });
-        root.join(".nnn.toml")
-    });
+fn cmd_add_path(dir: &str, write: bool, global: bool) {
+    let project_path = if global {
+        global_config_path()
+    } else {
+        find_project_config().unwrap_or_else(|| {
+            let root = find_git_root().unwrap_or_else(|| {
+                std::env::current_dir().expect("cwd available")
+            });
+            root.join(".nnn.toml")
+        })
+    };
 
     if let Some(parent) = project_path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -196,6 +235,28 @@ fn cmd_show() {
         print_paths("allow-read", &global_cfg.allow_read);
         print_paths("allow-write", &global_cfg.allow_write);
     }
+}
+
+fn cmd_init() {
+    let path = global_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+            eprintln!("nnn: create {}: {e}", parent.display());
+            std::process::exit(1);
+        });
+    }
+
+    if path.exists() {
+        eprintln!("nnn: {} already exists", path.display());
+        std::process::exit(1);
+    }
+
+    std::fs::write(&path, DEFAULT_CONFIG).unwrap_or_else(|e| {
+        eprintln!("nnn: write {}: {e}", path.display());
+        std::process::exit(1);
+    });
+
+    println!("wrote {}", path.display());
 }
 
 fn print_config(path: &Path) {
@@ -346,15 +407,30 @@ fn exec_command(command: &[String], env: &[(String, String)]) -> std::io::Error 
     cmd.exec()
 }
 
+// ── Path expansion ──
+
+/// Expand leading `~/` or `~` to `$HOME`.
+fn expand_tilde(s: &str) -> String {
+    if s == "~" {
+        std::env::var("HOME").unwrap_or_default()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            Path::new(&home).join(rest).to_string_lossy().to_string()
+        } else {
+            s.to_string()
+        }
+    } else {
+        s.to_string()
+    }
+}
+
 // ── Landlock ──
 
-/// System paths always readable.
 const SYSTEM_READ_PATHS: &[&str] = &[
     "/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc", "/proc",
     "/sys", "/run", "/var", "/opt", "/dev", "/tmp",
 ];
 
-/// System paths always writable.
 const SYSTEM_WRITE_PATHS: &[&str] = &["/dev/null", "/dev/tty", "/tmp", "/var/tmp"];
 
 fn landlock_access_read() -> landlock::BitFlags<AccessFs> {
@@ -374,17 +450,12 @@ fn landlock_access_write(abi: ABI) -> landlock::BitFlags<AccessFs> {
     flags
 }
 
-fn landlock_apply(config: &Config, warn: bool) -> Result<(), String> {
+fn landlock_apply(config: &Config, auto_cwd: bool) -> Result<(), String> {
     let abi = ABI::V5;
 
     let fs_access = AccessFs::from_all(abi);
     if fs_access.is_empty() {
         log::warn!("landlock: not supported on this kernel, skipping");
-        return Ok(());
-    }
-
-    if warn {
-        landlock_log_planned(config);
         return Ok(());
     }
 
@@ -404,17 +475,21 @@ fn landlock_apply(config: &Config, warn: bool) -> Result<(), String> {
         ruleset = landlock_add_rule(ruleset, path, landlock_access_write(abi));
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd_str = cwd.to_string_lossy().to_string();
-        ruleset = landlock_add_rule(ruleset, &cwd_str, landlock_access_write(abi));
+    if auto_cwd {
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd_str = cwd.to_string_lossy().to_string();
+            ruleset = landlock_add_rule(ruleset, &cwd_str, landlock_access_write(abi));
+        }
     }
 
     for p in &config.allow_read {
-        ruleset = landlock_add_rule(ruleset, p, landlock_access_read());
+        let expanded = expand_tilde(p);
+        ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_read());
     }
 
     for p in &config.allow_write {
-        ruleset = landlock_add_rule(ruleset, p, landlock_access_write(abi));
+        let expanded = expand_tilde(p);
+        ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_write(abi));
     }
 
     ruleset
@@ -469,24 +544,5 @@ fn landlock_add_rule(
             log::debug!("landlock: failed to open {path}: {e}");
             ruleset
         }
-    }
-}
-
-fn landlock_log_planned(config: &Config) {
-    log::warn!("landlock: warn mode — logging planned rules without enforcing");
-    for path in SYSTEM_READ_PATHS {
-        log::warn!("  would allow ro: {path}");
-    }
-    for path in SYSTEM_WRITE_PATHS {
-        log::warn!("  would allow rw: {path}");
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        log::warn!("  would allow rw: {} (cwd)", cwd.display());
-    }
-    for p in &config.allow_read {
-        log::warn!("  would allow ro: {p} (config)");
-    }
-    for p in &config.allow_write {
-        log::warn!("  would allow rw: {p} (config)");
     }
 }
