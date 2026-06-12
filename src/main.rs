@@ -1,9 +1,12 @@
 #![deny(unsafe_code)]
 #![deny(clippy::panic)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use landlock::{
-    make_bitflags, Access, AccessFs, PathBeneath, PathFd, Ruleset, ABI,
+    make_bitflags, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+    ABI,
 };
 use std::path::{Path, PathBuf};
 
@@ -117,9 +120,18 @@ fn main() {
 
     let result = match cli.command {
         Command::Exec(args) => cmd_exec(args),
-        Command::AddRo(args) => cmd_add_path(&args.dir, false, args.global),
-        Command::AddRw(args) => cmd_add_path(&args.dir, true, args.global),
-        Command::Show => cmd_show(),
+        Command::AddRo(args) => {
+            cmd_add_path(&args.dir, false, args.global);
+            Ok(())
+        },
+        Command::AddRw(args) => {
+            cmd_add_path(&args.dir, true, args.global);
+            Ok(())
+        },
+        Command::Show => {
+            cmd_show();
+            Ok(())
+        },
         Command::Other(args) if args.is_empty() => {
             eprintln!("nnn: expected a command to run");
             std::process::exit(1);
@@ -131,7 +143,10 @@ fn main() {
             project_config: None,
             command: args,
         }),
-        Command::Init => cmd_init(),
+        Command::Init => {
+            cmd_init();
+            Ok(())
+        },
     };
 
     if let Err(e) = result {
@@ -187,8 +202,13 @@ fn cmd_add_path(dir: &str, write: bool, global: bool) {
         global_config_path()
     } else {
         find_project_config().unwrap_or_else(|| {
-            let root =
-                find_git_root().unwrap_or_else(|| std::env::current_dir().expect("cwd available"));
+            let root = find_git_root().unwrap_or_else(|| match std::env::current_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("nnn: no cwd: {e}");
+                    std::process::exit(1);
+                }
+            });
             root.join(".nnn.toml")
         })
     };
@@ -206,11 +226,14 @@ fn cmd_add_path(dir: &str, write: bool, global: bool) {
 
     let key = if write { "allow-write" } else { "allow-read" };
 
-    if !doc.get(key).and_then(|item| item.as_array()).is_some() {
+    if doc.get(key).and_then(|item| item.as_array()).is_none() {
         doc[key] = toml_edit::value(toml_edit::Array::new());
     }
 
-    let arr = doc[key].as_array_mut().expect("expected array");
+    let arr = doc[key].as_array_mut().unwrap_or_else(|| {
+        eprintln!("nnn: {} is not an array in config", key);
+        std::process::exit(1);
+    });
     if !arr.iter().any(|v| v.as_str() == Some(dir)) {
         arr.push(dir);
     }
@@ -389,9 +412,9 @@ fn find_git_root() -> Option<PathBuf> {
     }
 }
 
-fn load_toml_file(path: &Path) -> Result<Config, String> {
+fn load_toml_file(path: &Path) -> anyhow::Result<Config> {
     let data =
-        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "kebab-case")]
     struct Raw {
@@ -401,7 +424,7 @@ fn load_toml_file(path: &Path) -> Result<Config, String> {
         allow_write: Vec<String>,
     }
     let raw: Raw =
-        toml_edit::de::from_str(&data).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        toml_edit::de::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Config {
         allow_read: raw.allow_read,
         allow_write: raw.allow_write,
@@ -565,8 +588,7 @@ fn landlock_add_rule(
         }
     }
 
-    let fd = PathFd::new(path)
-        .with_context(|| format!("opening {path} for Landlock rule"))?;
+    let fd = PathFd::new(path).with_context(|| format!("opening {path} for Landlock rule"))?;
     let rule = PathBeneath::new(fd, access);
 
     match ruleset.add_rule(rule) {
