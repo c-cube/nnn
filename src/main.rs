@@ -74,6 +74,7 @@ const DEFAULT_CONFIG: &str = concat!(
     "    \"/bin/\",\n",
     "    \"/usr/bin/\",\n",
     "    \"/usr/local/bin\",\n",
+    "    \"/etc/\",\n",
     "    \"~/.cargo/bin\",\n",
     "    \"~/.config/nnn\",\n",
     "]\n",
@@ -159,23 +160,13 @@ struct AddArgs {
 fn main() {
     let cli = Cli::parse();
 
-    let result = match cli.command {
+    if let Err(e) = match cli.command {
         Command::Exec(args) => cmd_exec(args),
-        Command::AddRo(args) => {
-            cmd_add_path(&args.dir, false, args.global);
-            Ok(())
-        }
-        Command::AddRw(args) => {
-            cmd_add_path(&args.dir, true, args.global);
-            Ok(())
-        }
-        Command::Show => {
-            cmd_show();
-            Ok(())
-        }
+        Command::AddRo(args) => cmd_add_path(&args.dir, false, args.global),
+        Command::AddRw(args) => cmd_add_path(&args.dir, true, args.global),
+        Command::Show => cmd_show(),
         Command::Other(args) if args.is_empty() => {
-            eprintln!("nnn: expected a command to run");
-            std::process::exit(1);
+            Err(anyhow::anyhow!("expected a command to run"))
         }
         Command::Other(args) => cmd_exec(ExecArgs {
             no_auto_cwd: false,
@@ -185,13 +176,8 @@ fn main() {
             project_config: None,
             command: args,
         }),
-        Command::Init => {
-            cmd_init();
-            Ok(())
-        }
-    };
-
-    if let Err(e) = result {
+        Command::Init => cmd_init(),
+    } {
         eprintln!("nnn: {e:#}");
         std::process::exit(1);
     }
@@ -200,7 +186,7 @@ fn main() {
 fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let mut cfg = resolve_config(args.project_config.as_deref());
+    let mut cfg = resolve_config(args.project_config.as_deref())?;
 
     // NNN_CONFIG: additional config file
     if let Ok(extra) = std::env::var("NNN_CONFIG") {
@@ -248,29 +234,35 @@ fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
     Err(anyhow::anyhow!("exec of {:?} failed: {err}", args.command))
 }
 
-fn cmd_add_path(dir: &str, write: bool, global: bool) {
+fn cmd_add_path(dir: &str, write: bool, global: bool) -> anyhow::Result<()> {
     let project_path = if global {
         global_config_path()
     } else {
-        find_project_config().unwrap_or_else(|| {
-            let root = find_git_root().unwrap_or_else(|| match std::env::current_dir() {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("nnn: no cwd: {e}");
-                    std::process::exit(1);
-                }
-            });
-            root.join(".nnn.toml")
-        })
+        match find_project_config() {
+            Some(p) => p,
+            None => {
+                let root = match find_git_root() {
+                    Some(r) => r,
+                    None => match std::env::current_dir() {
+                        Ok(d) => d,
+                        Err(_) => PathBuf::from("."),
+                    },
+                };
+                root.join(".nnn.toml")
+            }
+        }
     };
 
     if let Some(parent) = project_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
 
     let mut doc: DocumentMut = if project_path.exists() {
-        let data = std::fs::read_to_string(&project_path).unwrap_or_default();
-        data.parse().unwrap_or_default()
+        let data = std::fs::read_to_string(&project_path)
+            .with_context(|| format!("reading {}", project_path.display()))?;
+        data.parse()
+            .with_context(|| format!("parsing {}", project_path.display()))?
     } else {
         DocumentMut::new()
     };
@@ -281,23 +273,21 @@ fn cmd_add_path(dir: &str, write: bool, global: bool) {
         doc[key] = toml_edit::value(toml_edit::Array::new());
     }
 
-    let arr = doc[key].as_array_mut().unwrap_or_else(|| {
-        eprintln!("nnn: {} is not an array in config", key);
-        std::process::exit(1);
-    });
+    let arr = doc[key]
+        .as_array_mut()
+        .with_context(|| format!("{key} is not an array in config"))?;
     if !arr.iter().any(|v| v.as_str() == Some(dir)) {
         arr.push(dir);
     }
 
-    std::fs::write(&project_path, doc.to_string()).unwrap_or_else(|e| {
-        eprintln!("nnn: write {}: {e}", project_path.display());
-        std::process::exit(1);
-    });
+    std::fs::write(&project_path, doc.to_string())
+        .with_context(|| format!("writing {}", project_path.display()))?;
 
     println!("added {} to {}", dir, project_path.display());
+    Ok(())
 }
 
-fn cmd_show() {
+fn cmd_show() -> anyhow::Result<()> {
     let global_path = global_config_path();
     let project_path = find_project_config();
 
@@ -308,7 +298,7 @@ fn cmd_show() {
         println!("  (not found)");
     }
 
-    let global_cfg = load_global_config();
+    let global_cfg = load_global_config()?;
     if let Some(ref pp) = project_path {
         println!("\nProject config: {}", pp.display());
         print_config(pp);
@@ -328,6 +318,7 @@ fn cmd_show() {
         print_paths("allow-write", &global_cfg.allow_write);
         print_network(&global_cfg.network);
     }
+    Ok(())
 }
 
 fn print_network(net: &NetworkConfig) {
@@ -347,26 +338,21 @@ fn print_network(net: &NetworkConfig) {
     }
 }
 
-fn cmd_init() {
+fn cmd_init() -> anyhow::Result<()> {
     let path = global_config_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-            eprintln!("nnn: create {}: {e}", parent.display());
-            std::process::exit(1);
-        });
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
 
     if path.exists() {
-        eprintln!("nnn: {} already exists", path.display());
-        std::process::exit(1);
+        anyhow::bail!("{} already exists", path.display());
     }
 
-    std::fs::write(&path, DEFAULT_CONFIG).unwrap_or_else(|e| {
-        eprintln!("nnn: write {}: {e}", path.display());
-        std::process::exit(1);
-    });
+    std::fs::write(&path, DEFAULT_CONFIG).with_context(|| format!("writing {}", path.display()))?;
 
     println!("wrote {}", path.display());
+    Ok(())
 }
 
 fn print_config(path: &Path) {
@@ -420,6 +406,8 @@ fn env_overrides() -> Config {
                     if !cfg.network.allow_ports.contains(&port) {
                         cfg.network.allow_ports.push(port);
                     }
+                } else {
+                    log::warn!("NNN_ALLOW_PORT: ignoring invalid port: {p}");
                 }
             }
         }
@@ -437,43 +425,32 @@ fn env_overrides() -> Config {
     cfg
 }
 
-fn resolve_config(explicit_project: Option<&Path>) -> Config {
-    let global_cfg = load_global_config();
+fn resolve_config(explicit_project: Option<&Path>) -> anyhow::Result<Config> {
+    let global_cfg = load_global_config()?;
     let project_path = explicit_project
         .map(|p| p.to_path_buf())
         .or_else(find_project_config);
 
     let mut cfg = global_cfg;
     if let Some(path) = project_path {
-        match load_toml_file(&path) {
-            Ok(project_cfg) => {
-                log::info!("loaded project config from {}", path.display());
-                cfg = cfg.merge(&project_cfg);
-            }
-            Err(e) => {
-                eprintln!("nnn: {e}");
-                std::process::exit(1);
-            }
-        }
+        let project_cfg =
+            load_toml_file(&path).with_context(|| format!("loading {}", path.display()))?;
+        log::info!("loaded project config from {}", path.display());
+        cfg = cfg.merge(&project_cfg);
     }
-    cfg
+    Ok(cfg)
 }
 
-fn load_global_config() -> Config {
+fn load_global_config() -> anyhow::Result<Config> {
     let path = global_config_path();
     if path.exists() {
-        match load_toml_file(&path) {
-            Ok(cfg) => {
-                log::info!("loaded global config from {}", path.display());
-                return cfg;
-            }
-            Err(e) => {
-                eprintln!("nnn: {e}");
-                std::process::exit(1);
-            }
-        }
+        let cfg = load_toml_file(&path)
+            .with_context(|| format!("loading global config from {}", path.display()))?;
+        log::info!("loaded global config from {}", path.display());
+        Ok(cfg)
+    } else {
+        Ok(Config::default())
     }
-    Config::default()
 }
 
 fn global_config_path() -> PathBuf {
@@ -591,7 +568,7 @@ fn exec_command(command: &[String], env: &[(String, String)]) -> std::io::Error 
 /// Expand leading `~/` or `~` to `$HOME`.
 fn expand_tilde(s: &str) -> String {
     if s == "~" {
-        std::env::var("HOME").unwrap_or_default()
+        std::env::var("HOME").unwrap_or_else(|_| s.to_string())
     } else if let Some(rest) = s.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             Path::new(&home).join(rest).to_string_lossy().to_string()
