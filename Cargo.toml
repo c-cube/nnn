@@ -7,8 +7,10 @@ description = "Minimal Linux sandbox using Landlock"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "usage", "suggestions"] }
+libc = "0.2"
 log = "0.4"
 env_logger = { version = "0.11", default-features = false }
 serde = { version = "1", features = ["derive"] }
-toml_edit = { version = "0.22", features = ["serde"] }
+seccompiler = "0.5"
+toml_edit = { version = "0.22", default-features = false, features = ["display", "parse", "serde"] }
 landlock = "0.4"

@@ -5,8 +5,8 @@
 
 use anyhow::{bail, Context};
 use landlock::{
-    make_bitflags, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
-    ABI,
+    make_bitflags, Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
+    RulesetCreatedAttr, ABI,
 };
 use std::path::{Path, PathBuf};
 
@@ -16,12 +16,35 @@ use toml_edit::DocumentMut;
 // ── Config ──
 
 #[derive(Debug, Default, Clone)]
+struct NetworkConfig {
+    deny_tcp: Option<bool>,
+    deny_udp: Option<bool>,
+    allow_ports: Vec<u16>,
+}
+
+impl NetworkConfig {
+    fn is_deny_tcp(&self) -> bool {
+        self.deny_tcp.unwrap_or(false)
+    }
+    fn is_deny_udp(&self) -> bool {
+        self.deny_udp.unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 struct Config {
     allow_read: Vec<String>,
     allow_write: Vec<String>,
+    /// None = use built-in default (true).
+    seccomp: Option<bool>,
+    network: NetworkConfig,
 }
 
 impl Config {
+    fn seccomp_enabled(&self) -> bool {
+        self.seccomp.unwrap_or(true)
+    }
+
     fn merge(&self, overlay: &Config) -> Config {
         let mut c = self.clone();
         for p in &overlay.allow_read {
@@ -32,6 +55,14 @@ impl Config {
         for p in &overlay.allow_write {
             if !c.allow_write.contains(p) {
                 c.allow_write.push(p.clone());
+            }
+        }
+        c.seccomp = overlay.seccomp.or(c.seccomp);
+        c.network.deny_tcp = overlay.network.deny_tcp.or(c.network.deny_tcp);
+        c.network.deny_udp = overlay.network.deny_udp.or(c.network.deny_udp);
+        for p in &overlay.network.allow_ports {
+            if !c.network.allow_ports.contains(p) {
+                c.network.allow_ports.push(*p);
             }
         }
         c
@@ -50,6 +81,12 @@ const DEFAULT_CONFIG: &str = concat!(
     "allow-write = [\n",
     "    \"/tmp/nnn/\",\n",
     "]\n",
+    "\n",
+    "# Network restrictions (Landlock ABI V4+, kernel >= 5.19)\n",
+    "# [network]\n",
+    "# deny-tcp = false\n",
+    "# deny-udp = false\n",
+    "# allow-ports = [80, 443, 22]\n",
 );
 
 // ── CLI ──
@@ -94,6 +131,10 @@ struct ExecArgs {
     #[arg(long)]
     allow_write: Vec<String>,
 
+    /// Additional TCP ports allowed for outbound connect
+    #[arg(long)]
+    allow_port: Vec<u16>,
+
     /// Path to project .nnn.toml (auto-detected from git root)
     #[arg(long)]
     project_config: Option<PathBuf>,
@@ -123,15 +164,15 @@ fn main() {
         Command::AddRo(args) => {
             cmd_add_path(&args.dir, false, args.global);
             Ok(())
-        },
+        }
         Command::AddRw(args) => {
             cmd_add_path(&args.dir, true, args.global);
             Ok(())
-        },
+        }
         Command::Show => {
             cmd_show();
             Ok(())
-        },
+        }
         Command::Other(args) if args.is_empty() => {
             eprintln!("nnn: expected a command to run");
             std::process::exit(1);
@@ -140,13 +181,14 @@ fn main() {
             no_auto_cwd: false,
             allow_read: Vec::new(),
             allow_write: Vec::new(),
+            allow_port: Vec::new(),
             project_config: None,
             command: args,
         }),
         Command::Init => {
             cmd_init();
             Ok(())
-        },
+        }
     };
 
     if let Err(e) = result {
@@ -186,10 +228,19 @@ fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
             cfg.allow_write.push(p.clone());
         }
     }
+    for &p in &args.allow_port {
+        if !cfg.network.allow_ports.contains(&p) {
+            cfg.network.allow_ports.push(p);
+        }
+    }
 
     log::info!("resolved config: {cfg:#?}");
 
     let env = hardened_env();
+
+    if cfg.seccomp_enabled() {
+        seccomp_apply()?;
+    }
 
     landlock_apply(&cfg, !args.no_auto_cwd)?;
 
@@ -267,6 +318,7 @@ fn cmd_show() {
                 println!("\nResolved (merged):");
                 print_paths("allow-read", &merged.allow_read);
                 print_paths("allow-write", &merged.allow_write);
+                print_network(&merged.network);
             }
             Err(e) => eprintln!("  error: {e}"),
         }
@@ -274,6 +326,24 @@ fn cmd_show() {
         println!("\nResolved (global only):");
         print_paths("allow-read", &global_cfg.allow_read);
         print_paths("allow-write", &global_cfg.allow_write);
+        print_network(&global_cfg.network);
+    }
+}
+
+fn print_network(net: &NetworkConfig) {
+    if net.deny_tcp.is_some() || net.deny_udp.is_some() || !net.allow_ports.is_empty() {
+        println!("  network:");
+        if net.deny_tcp.is_some() {
+            println!("    deny-tcp: {}", net.deny_tcp.unwrap_or(false));
+        }
+        if net.deny_udp.is_some() {
+            println!("    deny-udp: {}", net.deny_udp.unwrap_or(false));
+        }
+        if !net.allow_ports.is_empty() {
+            println!("    allow-ports: {:?}", net.allow_ports);
+        }
+    } else {
+        println!("  network: (unrestricted)");
     }
 }
 
@@ -322,7 +392,8 @@ fn print_paths(label: &str, paths: &[String]) {
 
 // ── Config resolution ──
 
-/// Parse comma-separated env vars NNN_RO and NNN_RW.
+/// Parse comma-separated env vars NNN_RO, NNN_RW, NNN_ALLOW_PORT,
+/// and bool env vars NNN_DENY_TCP, NNN_DENY_UDP.
 fn env_overrides() -> Config {
     let mut cfg = Config::default();
     if let Ok(val) = std::env::var("NNN_RO") {
@@ -339,6 +410,28 @@ fn env_overrides() -> Config {
             if !p.is_empty() && !cfg.allow_write.contains(&p) {
                 cfg.allow_write.push(p);
             }
+        }
+    }
+    if let Ok(val) = std::env::var("NNN_ALLOW_PORT") {
+        for p in val.split(',') {
+            let p = p.trim();
+            if !p.is_empty() {
+                if let Ok(port) = p.parse::<u16>() {
+                    if !cfg.network.allow_ports.contains(&port) {
+                        cfg.network.allow_ports.push(port);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(val) = std::env::var("NNN_DENY_TCP") {
+        if val == "true" || val == "1" {
+            cfg.network.deny_tcp = Some(true);
+        }
+    }
+    if let Ok(val) = std::env::var("NNN_DENY_UDP") {
+        if val == "true" || val == "1" {
+            cfg.network.deny_udp = Some(true);
         }
     }
     cfg
@@ -422,12 +515,36 @@ fn load_toml_file(path: &Path) -> anyhow::Result<Config> {
         allow_read: Vec<String>,
         #[serde(default)]
         allow_write: Vec<String>,
+        #[serde(default)]
+        seccomp: Option<bool>,
+        #[serde(default)]
+        network: Option<NetworkRaw>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct NetworkRaw {
+        #[serde(default)]
+        deny_tcp: Option<bool>,
+        #[serde(default)]
+        deny_udp: Option<bool>,
+        #[serde(default)]
+        allow_ports: Vec<u16>,
     }
     let raw: Raw =
         toml_edit::de::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
+    let network = match raw.network {
+        Some(n) => NetworkConfig {
+            deny_tcp: n.deny_tcp,
+            deny_udp: n.deny_udp,
+            allow_ports: n.allow_ports,
+        },
+        None => NetworkConfig::default(),
+    };
     Ok(Config {
         allow_read: raw.allow_read,
         allow_write: raw.allow_write,
+        seccomp: raw.seccomp,
+        network,
     })
 }
 
@@ -486,7 +603,60 @@ fn expand_tilde(s: &str) -> String {
     }
 }
 
-// ── Landlock ──
+// ── Seccomp ──
+
+/// Apply a seccomp-bpf deny list: block dangerous syscalls Landlock doesn't cover.
+fn seccomp_apply() -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+
+    let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
+
+    let blocked: &[i64] = &[
+        libc::SYS_ptrace,
+        libc::SYS_bpf,
+        libc::SYS_kexec_load,
+        libc::SYS_kexec_file_load,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_iopl,
+        libc::SYS_ioperm,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+        libc::SYS_pivot_root,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_sethostname,
+        libc::SYS_setdomainname,
+    ];
+
+    for &syscall in blocked {
+        rules.insert(syscall, vec![]);
+    }
+
+    let target_arch: seccompiler::TargetArch = std::env::consts::ARCH
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("unsupported arch: {}", std::env::consts::ARCH))?;
+
+    let filter = seccompiler::SeccompFilter::new(
+        rules,
+        seccompiler::SeccompAction::Allow,
+        seccompiler::SeccompAction::KillProcess,
+        target_arch,
+    )
+    .context("building seccomp filter")?;
+
+    let bpf: seccompiler::BpfProgram = filter
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("seccomp filter compilation failed"))?;
+
+    seccompiler::apply_filter(&bpf).context("applying seccomp filter (need Linux >= 3.5)")?;
+
+    log::info!("seccomp: restrictions applied");
+    Ok(())
+}
 
 const SYSTEM_READ_PATHS: &[&str] = &[
     "/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc", "/proc", "/sys", "/run", "/var",
@@ -521,9 +691,30 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
         anyhow::bail!("landlock not supported on this kernel (need Linux >= 5.13)");
     }
 
-    let ruleset = Ruleset::default()
-        .handle_access(fs_access)
-        .map_err(|e| anyhow::anyhow!("landlock: kernel rejected access rights (kernel too old?): {e}"))?;
+    let deny_tcp = config.network.is_deny_tcp();
+    let deny_udp = config.network.is_deny_udp();
+    let net_restricted = deny_tcp || deny_udp || !config.network.allow_ports.is_empty();
+
+    if deny_udp {
+        log::warn!("landlock: deny-udp requires AccessNet::ConnectUdp which is not available in landlock 0.4 — ignored");
+    }
+
+    let mut ruleset = Ruleset::default().handle_access(fs_access).map_err(|e| {
+        anyhow::anyhow!("landlock: kernel rejected access rights (kernel too old?): {e}")
+    })?;
+
+    if net_restricted {
+        let net_access = AccessNet::from_all(abi);
+        let handle = make_bitflags!(AccessNet::{BindTcp | ConnectTcp});
+        if !net_access.intersects(handle) {
+            anyhow::bail!(
+                "landlock: network restrictions require Landlock ABI V4+ (kernel >= 5.19)"
+            );
+        }
+        ruleset = ruleset
+            .handle_access(handle)
+            .map_err(|e| anyhow::anyhow!("landlock: kernel rejected net access rights: {e}"))?;
+    }
 
     let mut ruleset = ruleset
         .create()
@@ -557,6 +748,21 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
         let expanded = expand_tilde(p);
         ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_write(abi))
             .with_context(|| format!("adding write rule for {p}"))?;
+    }
+
+    if net_restricted {
+        for &port in &config.network.allow_ports {
+            let rule = NetPort::new(port, AccessNet::ConnectTcp);
+            match ruleset.add_rule(rule) {
+                Ok(rs) => {
+                    log::debug!("landlock: allow ConnectTcp port {port}");
+                    ruleset = rs;
+                }
+                Err(e) => {
+                    bail!("landlock: failed to add net port {port}: {e}")
+                }
+            }
+        }
     }
 
     ruleset.restrict_self().context("restrict_self")?;

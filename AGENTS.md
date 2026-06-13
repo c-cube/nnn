@@ -5,18 +5,19 @@ whitelisted directories. Nothing else.
 
 ## Design Goals
 
-- **Minimal surface.** One file (`src/main.rs`, ~590 lines). Six dependencies.
-  No profiles, deny lists, network filtering, or any feature that isn't
-  "whitelist directories for this process."
+- **Minimal surface.** One file (`src/main.rs`, ~680 lines). Eight dependencies.
+  No profiles, deny lists, or any feature that isn't
+  "restrict this process."
 - **Config is just paths.** Global config (`~/.config/nnn/config.toml`) sets
   your baseline. Project config (`.nnn.toml` in git root) adds project-specific
   paths. Both are just `allow_read` and `allow_write` arrays.
 - **CLI ergonomics.** `nnn add-ro ./src` edits `.nnn.toml` in place via
   `toml_edit` (preserving formatting). `nnn show` prints the resolved rules.
   No manual toml editing needed day-to-day.
-- **Landlock only.** No seccomp, no cgroups, no containers, no capabilities.
-  Landlock is the only sandboxing primitive. If Landlock can't enforce it
-  (e.g. denying reads within an allowed tree), nnn won't pretend otherwise.
+- **Landlock + seccomp.** Landlock restricts filesystem access. Seccomp-bpf
+  blocks dangerous syscalls (ptrace, bpf, mount, unshare, etc.) that Landlock
+  doesn't cover. Network can be denied by default (TCP connect only,
+  Landlock ABI V4+).
 - **One-shot exec.** nnn sandboxes itself and replaces its process with the
   target command. No daemon, no fork, no supervision tree.
 
@@ -27,7 +28,9 @@ whitelisted directories. Nothing else.
 | `anyhow` | Error handling with context (no panics) |
 | `clap` | CLI parsing (derive API, subcommands, external_subcommand) |
 | `env_logger` + `log` | Diagnostic logging (warn mode) |
+| `libc` | Syscall constants for seccomp filter |
 | `serde` | TOML deserialization (Raw struct in `load_toml_file`) |
+| `seccompiler` | seccomp-bpf filter compilation and application |
 | `toml_edit` | Reading + editing `.nnn.toml` (format-preserving) |
 | `landlock` | Landlock ABI bindings |
 
@@ -70,6 +73,7 @@ on the `Other` variant and treated as `nnn exec -- <command>` with defaults.
 ```sh
 nnn exec -- cargo build
 nnn exec --allow-read ./extra -- ./my-script
+nnn exec --allow-port 443 -- curl https://example.com
 nnn exec --no-auto-cwd -- curl example.com   # Don't auto-allow rw on cwd
 nnn x -- cargo build                          # alias
 ```
@@ -158,13 +162,13 @@ Rust CI — `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test`.
 
 ## Known Issues
 
-- `add_rule` failure panics with no recovery (Landlock's `RulesetCreated`
-  builder consumes self on `add_rule`, so there's no way to continue).
+- `add_rule` failure returns error (no panic). The `RulesetCreated`
+  builder consumes self on `add_rule`, so the ruleset is lost on failure.
 - Proc symlinks (`/dev/stdout`, `/dev/stderr` → `/proc/self/fd/*`) are
   silently skipped — Landlock rejects path references pointing into proc.
 - Landlock cannot deny reads within an allowed directory tree (the kernel
   limitation, not nnn's).
 - `ABI::V5` is hardcoded — may fail on kernels < 5.19. No runtime ABI
   detection or fallback.
-- No network sandboxing — Landlock ABI V4+ can restrict TCP connect,
-  but nnn doesn't restrict any network access.
+- Network restriction only covers TCP connect (Landlock ABI V4+). UDP is
+  unrestricted.
