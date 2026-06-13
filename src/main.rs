@@ -69,26 +69,25 @@ impl Config {
     }
 }
 
-const DEFAULT_CONFIG: &str = concat!(
-    "allow-read = [\n",
-    "    \"/bin/\",\n",
-    "    \"/usr/bin/\",\n",
-    "    \"/usr/local/bin\",\n",
-    "    \"/etc/\",\n",
-    "    \"~/.cargo/bin\",\n",
-    "    \"~/.config/nnn\",\n",
-    "]\n",
-    "\n",
-    "allow-write = [\n",
-    "    \"/tmp/nnn/\",\n",
-    "]\n",
-    "\n",
-    "# Network restrictions (Landlock ABI V4+, kernel >= 5.19)\n",
-    "# [network]\n",
-    "# deny-tcp = false\n",
-    "# deny-udp = false\n",
-    "# allow-ports = [80, 443, 22]\n",
-);
+const DEFAULT_CONFIG: &str = r#"allow-read = [
+    "/bin/",
+    "/usr/bin/",
+    "/usr/local/bin",
+    "/etc/ssl/", # for certs
+    "~/.config/nnn",
+]
+
+allow-write = [
+    "/tmp/",
+    "~/.cargo/",
+]
+
+# Network restrictions (Landlock ABI V4+, kernel >= 5.19)
+# [network]
+# deny-tcp = false
+# deny-udp = false
+# allow-ports = [80, 443, 22]
+"#;
 
 // ── CLI ──
 
@@ -220,6 +219,10 @@ fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
         }
     }
 
+    // When the same resolved path appears in both allow-read and allow-write,
+    // read-write wins. Remove it from allow_read so the write rule is authoritative.
+    cfg.allow_read.retain(|p| !cfg.allow_write.contains(p));
+
     log::info!("resolved config: {cfg:#?}");
 
     let env = hardened_env();
@@ -304,7 +307,10 @@ fn cmd_show() -> anyhow::Result<()> {
         print_config(pp);
         match load_toml_file(pp) {
             Ok(project_cfg) => {
-                let merged = global_cfg.merge(&project_cfg);
+                let mut merged = global_cfg.merge(&project_cfg);
+                merged
+                    .allow_read
+                    .retain(|p| !merged.allow_write.contains(p));
                 println!("\nResolved (merged):");
                 print_paths("allow-read", &merged.allow_read);
                 print_paths("allow-write", &merged.allow_write);
