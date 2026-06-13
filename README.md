@@ -26,3 +26,10 @@ export NNN_RW="$HOME/output"
 ```
 
 Landlock is the only primitive. Network is not restricted. Requires Linux ≥ 5.13.
+
+## Limitations
+
+- **Network not restricted.** Landlock does not support network sandboxing before ABI V4 (kernel < 5.19). nnn does not restrict network regardless — TCP/UDP connect, listen, and bind are all allowed.
+- **`/proc` is fully readable.** Landlock cannot deny reads within an allowed directory tree. Since `/proc` is a system default path, all process information (command lines, environment variables of other processes) is visible to the sandboxed process.
+- **No seccomp filter.** Landlock only restricts filesystem access. The sandboxed process can still use `ptrace`, `bpf`, `clone(CLONE_NEWNS)`, `mount`, and other syscalls that could be used for sandbox escape.
+- **No kernel ABI negotiation.** `ABI::V5` is hardcoded. Kernels between 5.13 and 5.18 will fail with an error about kernel ABI, not a graceful fallback.

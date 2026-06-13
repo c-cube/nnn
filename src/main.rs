@@ -194,7 +194,7 @@ fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
     landlock_apply(&cfg, !args.no_auto_cwd)?;
 
     let err = exec_command(&args.command, &env);
-    Err(anyhow::anyhow!("exec failed: {err}"))
+    Err(anyhow::anyhow!("exec of {:?} failed: {err}", args.command))
 }
 
 fn cmd_add_path(dir: &str, write: bool, global: bool) {
@@ -517,15 +517,17 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
 
     let fs_access = AccessFs::from_all(abi);
     if fs_access.is_empty() {
-        log::error!("landlock: not supported on this kernel");
-        anyhow::bail!("landlock not supported on this kernel");
+        log::error!("landlock: not supported on this kernel (need Linux >= 5.13)");
+        anyhow::bail!("landlock not supported on this kernel (need Linux >= 5.13)");
     }
 
     let ruleset = Ruleset::default()
         .handle_access(fs_access)
-        .context("creating ruleset")?;
+        .map_err(|e| anyhow::anyhow!("landlock: kernel rejected access rights (kernel too old?): {e}"))?;
 
-    let mut ruleset = ruleset.create().context("creating ruleset")?;
+    let mut ruleset = ruleset
+        .create()
+        .map_err(|e| anyhow::anyhow!("landlock: ruleset creation failed: {e}"))?;
 
     for path in SYSTEM_READ_PATHS {
         ruleset = landlock_add_rule(ruleset, path, landlock_access_read())
@@ -547,17 +549,13 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
 
     for p in &config.allow_read {
         let expanded = expand_tilde(p);
-        let canonical = std::fs::canonicalize(&expanded).unwrap_or(PathBuf::from(&expanded));
-        let resolved = canonical.to_string_lossy().to_string();
-        ruleset = landlock_add_rule(ruleset, &resolved, landlock_access_read())
+        ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_read())
             .with_context(|| format!("adding read rule for {p}"))?;
     }
 
     for p in &config.allow_write {
         let expanded = expand_tilde(p);
-        let canonical = std::fs::canonicalize(&expanded).unwrap_or(PathBuf::from(&expanded));
-        let resolved = canonical.to_string_lossy().to_string();
-        ruleset = landlock_add_rule(ruleset, &resolved, landlock_access_write(abi))
+        ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_write(abi))
             .with_context(|| format!("adding write rule for {p}"))?;
     }
 
@@ -572,23 +570,19 @@ fn landlock_add_rule(
     path: &str,
     access: landlock::BitFlags<AccessFs>,
 ) -> anyhow::Result<landlock::RulesetCreated> {
-    let p = Path::new(path);
-    if !p.exists() {
-        log::debug!("landlock: skipping non-existent path: {path}");
-        return Ok(ruleset);
-    }
-
-    if p.is_symlink() {
-        if let Ok(target) = std::fs::read_link(p) {
-            let ts = target.to_string_lossy();
-            if ts.starts_with("/proc/self/fd") || ts.starts_with("/proc/") {
-                log::debug!("landlock: skipping proc symlink: {path} -> {ts}");
-                return Ok(ruleset);
+    // PathFd::new resolves symlinks atomically — no TOCTOU window.
+    let fd = match PathFd::new(path) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("No such file") || msg.contains("entity not found") {
+                log::debug!("landlock: skipping non-existent path: {path}");
+            } else {
+                log::debug!("landlock: skipping {path}: {e}");
             }
+            return Ok(ruleset);
         }
-    }
-
-    let fd = PathFd::new(path).with_context(|| format!("opening {path} for Landlock rule"))?;
+    };
     let rule = PathBeneath::new(fd, access);
 
     match ruleset.add_rule(rule) {
