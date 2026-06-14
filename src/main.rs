@@ -219,6 +219,10 @@ fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
         }
     }
 
+    if !cfg.network.allow_ports.is_empty() && !cfg.network.deny_tcp.unwrap_or(false) {
+        log::warn!("allow-ports set without deny-tcp: deny_tcp=true implicitly");
+    }
+
     // When the same resolved path appears in both allow-read and allow-write,
     // read-write wins. Remove it from allow_read so the write rule is authoritative.
     cfg.allow_read.retain(|p| !cfg.allow_write.contains(p));
