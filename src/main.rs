@@ -131,8 +131,8 @@ struct ExecArgs {
     #[arg(long)]
     allow_write: Vec<String>,
 
-    /// Additional TCP ports allowed for outbound connect
-    #[arg(long)]
+    /// Additional TCP ports allowed for outbound connect (comma-separated)
+    #[arg(long, value_delimiter = ',')]
     allow_port: Vec<u16>,
 
     /// Path to project .nnn.toml (auto-detected from git root)
