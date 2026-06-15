@@ -123,6 +123,10 @@ struct ExecArgs {
     #[arg(long)]
     no_auto_cwd: bool,
 
+    /// Paths to make inaccessible (bind-mount over with empty tmpfs or /dev/null)
+    #[arg(short = 'e', long)]
+    exclude: Vec<String>,
+
     /// Additional read-allowed paths (appended to config)
     #[arg(long)]
     allow_read: Vec<String>,
@@ -169,6 +173,7 @@ fn main() {
         }
         Command::Other(args) => cmd_exec(ExecArgs {
             no_auto_cwd: false,
+            exclude: Vec::new(),
             allow_read: Vec::new(),
             allow_write: Vec::new(),
             allow_port: Vec::new(),
@@ -230,6 +235,12 @@ fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
     log::info!("resolved config: {cfg:#?}");
 
     let env = hardened_env();
+
+    // Set up private mount namespace and overlay excluded paths before seccomp
+    // blocks unshare/mount.
+    if !args.exclude.is_empty() {
+        setup_exclusions(&args.exclude)?;
+    }
 
     if cfg.seccomp_enabled() {
         seccomp_apply()?;
@@ -571,6 +582,96 @@ fn exec_command(command: &[String], env: &[(String, String)]) -> std::io::Error 
         cmd.env(k, v);
     }
     cmd.exec()
+}
+
+// ── Exclusion (bind-mount over denied paths) ──
+
+/// Create a private mount namespace and overlay tmpfs /dev/null on excluded paths.
+///
+/// Called *before* seccomp because seccomp blocks `unshare` and `mount`.
+/// The mount namespace is automatically torn down when the process exits
+/// (no cleanup needed).
+fn setup_exclusions(paths: &[String]) -> anyhow::Result<()> {
+    // Try mount namespace directly (works for root).
+    // On EPERM, try user namespace first (unprivileged).
+    let ret = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS);
+    match ret {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EPERM) => {
+            setup_user_namespace().context("setting up user namespace")?;
+            nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)
+                .context("unshare(CLONE_NEWNS) after user namespace")?;
+        }
+        Err(e) => {
+            anyhow::bail!("unshare(CLONE_NEWNS) failed: {e}");
+        }
+    }
+
+    let cwd = std::env::current_dir().context("getting cwd")?;
+
+    for path_str in paths {
+        let expanded = expand_tilde(path_str);
+        let raw = Path::new(&expanded);
+        let abs = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            cwd.join(raw)
+        };
+        let resolved = abs.canonicalize().with_context(|| {
+            format!("resolving excluded path '{path_str}' (use canonicalized path)")
+        })?;
+
+        let target = resolved.as_path();
+
+        if resolved.is_dir() {
+            nix::mount::mount(
+                Some("tmpfs"),
+                target,
+                Some("tmpfs"),
+                nix::mount::MsFlags::MS_NODEV
+                    | nix::mount::MsFlags::MS_NOEXEC
+                    | nix::mount::MsFlags::MS_NOSUID,
+                None::<&std::ffi::CStr>,
+            )
+            .with_context(|| format!("mounting tmpfs over {}", resolved.display()))?;
+            log::info!("excluded directory: {}", resolved.display());
+        } else if resolved.is_file() {
+            nix::mount::mount(
+                Some("/dev/null"),
+                target,
+                None::<&std::ffi::CStr>,
+                nix::mount::MsFlags::MS_BIND,
+                None::<&std::ffi::CStr>,
+            )
+            .with_context(|| format!("mounting /dev/null over {}", resolved.display()))?;
+            log::info!("excluded file: {}", resolved.display());
+        } else {
+            log::warn!(
+                "excluded path does not exist, skipping: {}",
+                resolved.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Set up a new user namespace so the process has `CAP_SYS_ADMIN` for `mount`.
+/// This is the standard unprivileged sandbox pattern (used by bubblewrap et al.).
+fn setup_user_namespace() -> anyhow::Result<()> {
+    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER)
+        .context("unshare(CLONE_NEWUSER) — user namespaces disabled on this system?")?;
+
+    let uid = nix::unistd::getuid().as_raw();
+    let gid = nix::unistd::getgid().as_raw();
+
+    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))
+        .context("writing /proc/self/uid_map")?;
+    std::fs::write("/proc/self/setgroups", "deny\n").context("writing /proc/self/setgroups")?;
+    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
+        .context("writing /proc/self/gid_map")?;
+
+    Ok(())
 }
 
 // ── Path expansion ──
