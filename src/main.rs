@@ -123,13 +123,17 @@ struct ExecArgs {
     #[arg(long)]
     no_auto_cwd: bool,
 
-    /// Additional read-allowed paths (appended to config)
+    /// Additional read-only paths (appended to config, like nnn add-ro)
     #[arg(long)]
-    allow_read: Vec<String>,
+    add_ro: Vec<String>,
 
-    /// Additional write-allowed paths (appended to config)
+    /// Additional read-write paths (appended to config, like nnn add-rw)
     #[arg(long)]
-    allow_write: Vec<String>,
+    add_rw: Vec<String>,
+
+    /// Deny all TCP connect/bind (Landlock ABI V4+)
+    #[arg(long)]
+    deny_tcp: bool,
 
     /// Additional TCP ports allowed for outbound connect (comma-separated)
     #[arg(long, value_delimiter = ',')]
@@ -169,8 +173,9 @@ fn main() {
         }
         Command::Other(args) => cmd_exec(ExecArgs {
             no_auto_cwd: false,
-            allow_read: Vec::new(),
-            allow_write: Vec::new(),
+            add_ro: Vec::new(),
+            add_rw: Vec::new(),
+            deny_tcp: false,
             allow_port: Vec::new(),
             project_config: None,
             command: args,
@@ -203,12 +208,17 @@ fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
     // NNN_RO/NNN_RW: comma-separated (before CLI flags)
     cfg = cfg.merge(&env_overrides());
 
-    for p in &args.allow_read {
+    // CLI deny_tcp flag overrides config / env
+    if args.deny_tcp {
+        cfg.network.deny_tcp = Some(true);
+    }
+
+    for p in &args.add_ro {
         if !cfg.allow_read.contains(p) {
             cfg.allow_read.push(p.clone());
         }
     }
-    for p in &args.allow_write {
+    for p in &args.add_rw {
         if !cfg.allow_write.contains(p) {
             cfg.allow_write.push(p.clone());
         }

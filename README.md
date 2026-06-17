@@ -21,7 +21,7 @@ nnn init                         # Write default global config
 Config: global (`~/.config/nnn/config.toml`, xdg config directory) + project (`.nnn.toml` in git root).
 Both are just `allow-read` and `allow-write` whitelists, combined at runtime.
 
-Additional CLI arguments `--allow-read`/`--allow-write`, as well as env variables
+Additional CLI arguments `--add-ro`/`--add-rw`, as well as env variables
 `NNN_RO` and `NNN_RW` can be used to add permissions in a more ad-hoc way
 (so it's compatible with [direnv](https://direnv.net/)).
 

@@ -72,7 +72,7 @@ on the `Other` variant and treated as `nnn exec -- <command>` with defaults.
 
 ```sh
 nnn exec -- cargo build
-nnn exec --allow-read ./extra -- ./my-script
+nnn exec --add-ro ./extra -- ./my-script
 nnn exec --allow-port 443 -- curl https://example.com
 nnn exec --no-auto-cwd -- curl example.com   # Don't auto-allow rw on cwd
 nnn x -- cargo build                          # alias
@@ -84,7 +84,7 @@ Config resolution order (each later step appends and deduplicates):
 2. Project config: `.nnn.toml` found by walking up from cwd
 3. `NNN_CONFIG` env: path to an additional TOML file (loaded after project config)
 4. `NNN_RO` / `NNN_RW` env: comma-separated paths (loaded before CLI flags)
-5. CLI flags: `--allow-read` / `--allow-write`
+5. CLI flags: `--add-ro` / `--add-rw`
 
 Global config is optional — if it doesn't exist, only system default paths
 are allowed. Project config is optional — if no `.nnn.toml` is found, only
