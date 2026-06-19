@@ -644,13 +644,14 @@ fn seccomp_apply() -> anyhow::Result<()> {
         seccompiler::SeccompAction::KillProcess,
         target_arch,
     )
-    .context("building seccomp filter")?;
+    .context("seccomp: failed to build seccomp-bpf filter (check syscall numbers)")?;
 
     let bpf: seccompiler::BpfProgram = filter
         .try_into()
-        .map_err(|_| anyhow::anyhow!("seccomp filter compilation failed"))?;
+        .context("seccomp: filter compilation failed (try disabling with `seccomp = false`)")?;
 
-    seccompiler::apply_filter(&bpf).context("applying seccomp filter (need Linux >= 3.5)")?;
+    seccompiler::apply_filter(&bpf)
+        .context("seccomp: failed to apply filter — kernel needs SECCOMP_FILTER (Linux >= 3.5, CONFIG_SECCOMP=y)")?;
 
     log::info!("seccomp: restrictions applied");
     Ok(())
@@ -685,8 +686,10 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
 
     let fs_access = AccessFs::from_all(abi);
     if fs_access.is_empty() {
-        log::error!("landlock: not supported on this kernel (need Linux >= 5.13)");
-        anyhow::bail!("landlock not supported on this kernel (need Linux >= 5.13)");
+        log::error!(
+            "landlock: not supported on this kernel (ABI {abi:?} returned empty access set)"
+        );
+        anyhow::bail!("landlock not supported on this kernel (need Linux >= 5.19 for ABI V5, or check CONFIG_SECCOMP_FILTER in kernel)");
     }
 
     let deny_tcp = config.network.is_deny_tcp();
@@ -698,7 +701,7 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
     }
 
     let mut ruleset = Ruleset::default().handle_access(fs_access).map_err(|e| {
-        anyhow::anyhow!("landlock: kernel rejected access rights (kernel too old?): {e}")
+        anyhow::anyhow!("landlock: kernel rejected access rights (need Linux >= 5.19, ABI V5): {e}")
     })?;
 
     if net_restricted {
@@ -709,14 +712,18 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
                 "landlock: network restrictions require Landlock ABI V4+ (kernel >= 5.19)"
             );
         }
-        ruleset = ruleset
-            .handle_access(handle)
-            .map_err(|e| anyhow::anyhow!("landlock: kernel rejected net access rights: {e}"))?;
+        ruleset = ruleset.handle_access(handle).map_err(|e| {
+            anyhow::anyhow!(
+                "landlock: kernel rejected net access rights (need Linux >= 5.19, ABI V4+): {e}"
+            )
+        })?;
     }
 
-    let mut ruleset = ruleset
-        .create()
-        .map_err(|e| anyhow::anyhow!("landlock: ruleset creation failed: {e}"))?;
+    let mut ruleset = ruleset.create().map_err(|e| {
+        anyhow::anyhow!(
+            "landlock: ruleset creation failed (check Landlock ABI support in kernel config): {e}"
+        )
+    })?;
 
     for path in SYSTEM_READ_PATHS {
         ruleset = landlock_add_rule(ruleset, path, landlock_access_read())
@@ -763,7 +770,9 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
         }
     }
 
-    let status = ruleset.restrict_self().context("restrict_self")?;
+    let status = ruleset
+        .restrict_self()
+        .context("landlock: restrict_self failed (process lacks CAP_SYS_ADMIN or Landlock not enabled in kernel)")?;
     if status.ruleset != RulesetStatus::FullyEnforced {
         anyhow::bail!(
             "Landlock restrictions not enforced: ruleset={:?}, landlock={:?} \
@@ -822,7 +831,7 @@ fn landlock_add_rule(
             Ok(rs)
         }
         Err(e) => {
-            bail!("add_rule failed for {path}: {e}")
+            bail!("landlock: add_rule failed for {path}: {e}")
         }
     }
 }
