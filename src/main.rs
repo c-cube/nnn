@@ -777,6 +777,11 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Access bits that are valid only for file FDs, not dirs
+const FILE_ACCESS: landlock::BitFlags<AccessFs> = make_bitflags!(AccessFs::{
+    ReadFile | WriteFile | Execute | Truncate | IoctlDev
+});
+
 fn landlock_add_rule(
     ruleset: landlock::RulesetCreated,
     path: &str,
@@ -795,11 +800,20 @@ fn landlock_add_rule(
             return Ok(ruleset);
         }
     };
-    let rule = PathBeneath::new(fd, access);
+
+    // decide exactly what access to get, depending on file vs dir
+    let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(true);
+    let effective_access = if is_dir { access } else { access & FILE_ACCESS };
+    if effective_access.is_empty() {
+        log::debug!("landlock: no applicable access bits for {path}, skipping");
+        return Ok(ruleset);
+    }
+
+    let rule = PathBeneath::new(fd, effective_access);
 
     match ruleset.add_rule(rule) {
         Ok(rs) => {
-            let mode = if access.contains(AccessFs::WriteFile) {
+            let mode = if effective_access.contains(AccessFs::WriteFile) {
                 "rw"
             } else {
                 "ro"
