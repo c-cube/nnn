@@ -252,6 +252,10 @@ fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
 }
 
 fn cmd_add_path(dir: &str, write: bool, global: bool) -> anyhow::Result<()> {
+    if !Path::new(dir).exists() {
+        anyhow::bail!("path does not exist: {dir}");
+    }
+
     let project_path = if global {
         global_config_path()
     } else {
