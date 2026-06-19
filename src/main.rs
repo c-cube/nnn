@@ -6,7 +6,7 @@
 use anyhow::{bail, Context};
 use landlock::{
     make_bitflags, Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, ABI,
+    RulesetCreatedAttr, RulesetStatus, ABI,
 };
 use std::path::{Path, PathBuf};
 
@@ -763,7 +763,15 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
         }
     }
 
-    ruleset.restrict_self().context("restrict_self")?;
+    let status = ruleset.restrict_self().context("restrict_self")?;
+    if status.ruleset != RulesetStatus::FullyEnforced {
+        anyhow::bail!(
+            "Landlock restrictions not enforced: ruleset={:?}, landlock={:?} \
+             (kernel too old or Landlock not enabled in kernel)",
+            status.ruleset,
+            status.landlock,
+        );
+    }
 
     log::info!("landlock: restrictions applied");
     Ok(())
