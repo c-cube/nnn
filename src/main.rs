@@ -113,8 +113,6 @@ enum Command {
     Show,
     /// Write default global config to ~/.config/nnn/config.toml
     Init,
-    #[command(external_subcommand)]
-    Other(Vec<String>),
 }
 
 #[derive(Parser)]
@@ -161,25 +159,24 @@ struct AddArgs {
 // ── Main ──
 
 fn main() {
-    let cli = Cli::parse();
+    let mut raw: Vec<String> = std::env::args().collect();
+
+    // `nnn -- <cmd>` → `nnn exec -- <cmd>` (only way to run a command
+    // without an explicit subcommand; bare `nnn <cmd>` is rejected by clap
+    // to avoid confusing mistakes like `nnn allow-read ~/`)
+    if raw.len() > 1 && raw[1] == "--" {
+        let mut exec_args = vec![raw[0].clone(), "exec".to_string(), "--".to_string()];
+        exec_args.extend(raw[2..].iter().cloned());
+        raw = exec_args;
+    }
+
+    let cli = Cli::parse_from(raw);
 
     if let Err(e) = match cli.command {
         Command::Exec(args) => cmd_exec(args),
         Command::AddRo(args) => cmd_add_path(&args.dir, false, args.global),
         Command::AddRw(args) => cmd_add_path(&args.dir, true, args.global),
         Command::Show => cmd_show(),
-        Command::Other(args) if args.is_empty() => {
-            Err(anyhow::anyhow!("expected a command to run"))
-        }
-        Command::Other(args) => cmd_exec(ExecArgs {
-            no_auto_cwd: false,
-            add_ro: Vec::new(),
-            add_rw: Vec::new(),
-            deny_tcp: false,
-            allow_port: Vec::new(),
-            project_config: None,
-            command: args,
-        }),
         Command::Init => cmd_init(),
     } {
         eprintln!("nnn: {e:#}");

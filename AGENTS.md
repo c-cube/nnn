@@ -65,8 +65,13 @@ nnn show                         # Show resolved rules for this directory
 nnn init                         # Write default global config
 ```
 
-Bare `nnn <command>` (no subcommand) is caught by `#[command(external_subcommand)]`
-on the `Other` variant and treated as `nnn exec -- <command>` with defaults.
+Bare `nnn <command>` (no subcommand) is **rejected** by clap to prevent
+confusing mistakes like `nnn allow-read ~/`. Use `--` to run a command
+without the explicit exec subcommand:
+
+```sh
+nnn -- cargo build     # equivalent to: nnn exec -- cargo build
+```
 
 ### `nnn exec`
 

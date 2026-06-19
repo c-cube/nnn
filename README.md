@@ -10,7 +10,7 @@ an easy CLI) and easy to audit (tiny codebase + dependency cone).
 
 ```sh
 nnn exec -- cargo build          # Run `cargo` but sandboxed
-nnn ls -lh                       # Same but omitting `exec`
+nnn -- cargo build               # Same with `--` instead of `exec`
 nnn add-ro ./src                 # Add read-only path to project config
 nnn add-rw ./output              # Add read-write path to project config
 nnn add-ro -g ~/.git             # Add read-only access to global config (xdg)
