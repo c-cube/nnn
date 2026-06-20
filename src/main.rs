@@ -113,6 +113,9 @@ enum Command {
     Show,
     /// Write default global config to ~/.config/nnn/config.toml
     Init,
+    /// Check if Landlock is available on this system (for testing)
+    #[command(hide = true)]
+    CheckLandlock,
 }
 
 #[derive(Parser)]
@@ -178,6 +181,9 @@ fn main() {
         Command::AddRw(args) => cmd_add_path(&args.dir, true, args.global),
         Command::Show => cmd_show(),
         Command::Init => cmd_init(),
+        Command::CheckLandlock => {
+            std::process::exit(if landlock_available() { 0 } else { 1 });
+        }
     } {
         eprintln!("nnn: {e:#}");
         std::process::exit(1);
@@ -679,6 +685,25 @@ fn landlock_access_write(abi: ABI) -> landlock::BitFlags<AccessFs> {
         flags |= AccessFs::Truncate;
     }
     flags
+}
+
+fn landlock_available() -> bool {
+    let abi = ABI::V5;
+    let fs_access = AccessFs::from_all(abi);
+    if fs_access.is_empty() {
+        return false;
+    }
+    let ruleset = match Ruleset::default()
+        .handle_access(fs_access)
+        .and_then(|r| r.create())
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    match ruleset.restrict_self() {
+        Ok(status) => status.ruleset == RulesetStatus::FullyEnforced,
+        Err(_) => false,
+    }
 }
 
 fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {

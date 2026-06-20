@@ -36,6 +36,13 @@ fn run_nnn(
     )
 }
 
+/// Check if nnn reports Landlock as available on this system.
+fn landlock_available() -> bool {
+    let mut cmd = Command::new(nnn_bin());
+    cmd.args(["check-landlock"]);
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
 /// Create a temporary directory for isolated tests.
 /// Each TestDir gets a unique counter to avoid parallel test conflicts.
 struct TestDir {
@@ -281,6 +288,9 @@ fn test_add_ro_global_flag() {
 
 #[test]
 fn test_exec_fails_without_landlock() {
+    if landlock_available() {
+        return;
+    }
     let td = TestDir::new();
     let (_, stderr, status) = run_nnn(
         &["exec", "--no-auto-cwd", "--", "true"],
@@ -296,12 +306,11 @@ fn test_exec_fails_without_landlock() {
 
 #[test]
 fn test_bare_exec_fails_without_landlock() {
+    if landlock_available() {
+        return;
+    }
     let td = TestDir::new();
-    let (_, stderr, status) = run_nnn(
-        &["--", "--no-auto-cwd", "true"],
-        td.project(),
-        td.xdg_home(),
-    );
+    let (_, stderr, status) = run_nnn(&["--", "true"], td.project(), td.xdg_home());
     assert!(!status.success(), "bare exec should fail");
     assert!(
         stderr.contains("not enforced"),
@@ -311,6 +320,9 @@ fn test_bare_exec_fails_without_landlock() {
 
 #[test]
 fn test_exec_seccomp_disabled_still_fails_without_landlock() {
+    if landlock_available() {
+        return;
+    }
     let td = TestDir::new();
     td.write_project_cfg("seccomp = false\n");
     let (_, stderr, status) = run_nnn(
@@ -379,6 +391,9 @@ fn test_add_ro_help_works() {
 
 #[test]
 fn test_nnn_config_env_loads_without_error() {
+    if landlock_available() {
+        return;
+    }
     let td = TestDir::new();
     let extra = td.xdg_home().join("extra.toml");
     std::fs::write(&extra, "allow-read = [\"/custom\"]\n").unwrap();
@@ -405,6 +420,9 @@ fn test_nnn_config_env_loads_without_error() {
 
 #[test]
 fn test_nnn_config_env_missing_path_warns() {
+    if landlock_available() {
+        return;
+    }
     let td = TestDir::new();
 
     let mut cmd = Command::new(nnn_bin());
