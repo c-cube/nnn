@@ -39,6 +39,9 @@ Seccomp is used to block some syscalls (unless `seccomp = false` is in config).
 
 Should require Linux ≥ 5.13.
 
+If `nnn` fails to setup landlock correctly, it will exit with an error rather
+than silently run the command sandboxlessly.
+
 ## Config
 
 Global (`~/.config/nnn/config.toml`) + project (`.nnn.toml` in closest git root, if present).
