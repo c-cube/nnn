@@ -15,6 +15,7 @@ nnn add-ro ./src                 # Add read-only path to project config
 nnn add-rw ./output              # Add read-write path to project config
 nnn add-ro -g ~/.git             # Add read-only access to global config (xdg)
 nnn show                         # Show resolved rules for current project
+nnn allow                        # Trust the current project config
 nnn init                         # Write default global config
 ```
 
@@ -30,6 +31,12 @@ Additional CLI arguments `--add-ro`/`--add-rw`, as well as env variables
 export NNN_RO="$HOME/src"
 export NNN_RW="$HOME/output"
 ```
+
+## Local config verification
+
+To prevent sandboxed code from poisoning `.nnn.toml`
+(typically writable, by cwd auto-grant), any change to `.nnn.toml` must be
+validated by the user via `nnn allow`, just like `direnv allow`.
 
 ## Syscall filtering
 

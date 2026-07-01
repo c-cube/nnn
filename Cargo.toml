@@ -14,3 +14,4 @@ serde = { version = "1", features = ["derive"] }
 seccompiler = "0.5"
 toml_edit = { version = "0.22", default-features = false, features = ["display", "parse", "serde"] }
 landlock = "0.4"
+sha2 = "0.10"

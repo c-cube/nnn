@@ -113,6 +113,8 @@ enum Command {
     /// Add a read-write path to the project config
     #[command(name = "add-rw")]
     AddRw(AddArgs),
+    /// Approve the current project config, so `exec` will trust it
+    Allow,
     /// Show resolved rules for the current directory
     Show,
     /// Write default global config to ~/.config/nnn/config.toml
@@ -183,6 +185,7 @@ fn main() {
         Command::Exec(args) => cmd_exec(args),
         Command::AddRo(args) => cmd_add_path(&args.dir, false, args.global),
         Command::AddRw(args) => cmd_add_path(&args.dir, true, args.global),
+        Command::Allow => cmd_allow(),
         Command::Show => cmd_show(),
         Command::Init => cmd_init(),
         Command::CheckLandlock => {
@@ -463,9 +466,23 @@ fn env_overrides() -> Config {
 
 fn resolve_config(explicit_project: Option<&Path>) -> anyhow::Result<Config> {
     let global_cfg = load_global_config()?;
-    let project_path = explicit_project
-        .map(|p| p.to_path_buf())
-        .or_else(find_project_config);
+
+    // An explicit --project-config is a deliberate choice made by the caller
+    // on this invocation, so it's trusted as-is. An auto-discovered
+    // .nnn.toml sits inside the directory the sandbox just wrote to (auto
+    // cwd), so a sandboxed command could have edited it to grant itself more
+    // permissions on the *next* run — only use it if it matches an
+    // explicitly `nnn allow`-ed version.
+    let project_path = match explicit_project {
+        Some(p) => Some(p.to_path_buf()),
+        None => match find_project_config() {
+            Some(p) => {
+                check_project_trust(&p)?;
+                Some(p)
+            }
+            None => None,
+        },
+    };
 
     let mut cfg = global_cfg;
     if let Some(path) = project_path {
@@ -475,6 +492,75 @@ fn resolve_config(explicit_project: Option<&Path>) -> anyhow::Result<Config> {
         cfg = cfg.merge(&project_cfg);
     }
     Ok(cfg)
+}
+
+// ── Trust store (protects auto-discovered project config from tampering) ──
+
+fn trust_store_path() -> PathBuf {
+    config_dir().join("nnn").join("trusted.toml")
+}
+
+fn hash_file_hex(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&data)))
+}
+
+fn trust_key(path: &Path) -> anyhow::Result<String> {
+    let canon = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+    Ok(canon.to_string_lossy().to_string())
+}
+
+fn load_trust_doc() -> anyhow::Result<DocumentMut> {
+    let path = trust_store_path();
+    if path.exists() {
+        let data = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        data.parse()
+            .with_context(|| format!("parsing {}", path.display()))
+    } else {
+        Ok(DocumentMut::new())
+    }
+}
+
+fn check_project_trust(path: &Path) -> anyhow::Result<()> {
+    let key = trust_key(path)?;
+    let hash = hash_file_hex(path)?;
+    let doc = load_trust_doc()?;
+    match doc.get(key.as_str()).and_then(|v| v.as_str()) {
+        Some(h) if h == hash => Ok(()),
+        Some(_) => bail!(untrusted_message(path, "has changed since it was approved")),
+        None => bail!(untrusted_message(path, "has not been approved yet")),
+    }
+}
+
+fn untrusted_message(path: &Path, reason: &str) -> String {
+    format!(
+        "UNTRUSTED PROJECT CONFIG: {p}\n  This file {reason}.\n  A sandboxed command could have edited it to grant itself extra\n  permissions on your next run. Review it, then run `nnn allow` to approve.",
+        p = path.display(),
+    )
+}
+
+fn cmd_allow() -> anyhow::Result<()> {
+    let path = find_project_config().context("no project config (.nnn.toml) found")?;
+    let key = trust_key(&path)?;
+    let hash = hash_file_hex(&path)?;
+
+    let mut doc = load_trust_doc()?;
+    doc[key.as_str()] = toml_edit::value(hash.clone());
+
+    let store_path = trust_store_path();
+    if let Some(parent) = store_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&store_path, doc.to_string())
+        .with_context(|| format!("writing {}", store_path.display()))?;
+
+    println!("allowed {} ({})", path.display(), &hash[..12]);
+    Ok(())
 }
 
 fn load_global_config() -> anyhow::Result<Config> {
@@ -904,44 +990,4 @@ fn landlock_add_rule(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_env_matches_exact() {
-        assert!(env_matches("HOME", DEFAULT_ENV_ALLOWLIST));
-        assert!(env_matches("PATH", DEFAULT_ENV_ALLOWLIST));
-        assert!(env_matches("LANG", DEFAULT_ENV_ALLOWLIST));
-        assert!(!env_matches("AWS_SECRET_KEY", DEFAULT_ENV_ALLOWLIST));
-        assert!(!env_matches("GITHUB_TOKEN", DEFAULT_ENV_ALLOWLIST));
-        assert!(!env_matches("LD_PRELOAD", DEFAULT_ENV_ALLOWLIST));
-    }
-
-    #[test]
-    fn test_env_matches_prefix() {
-        assert!(env_matches("LC_ALL", DEFAULT_ENV_ALLOWLIST));
-        assert!(env_matches("LC_CTYPE", DEFAULT_ENV_ALLOWLIST));
-        assert!(env_matches("XDG_RUNTIME_DIR", DEFAULT_ENV_ALLOWLIST));
-        assert!(env_matches("XDG_CONFIG_HOME", DEFAULT_ENV_ALLOWLIST));
-        assert!(env_matches("XDG_DATA_HOME", DEFAULT_ENV_ALLOWLIST));
-        // "LC" without underscore should not match "LC_*" prefix
-        assert!(!env_matches("LC", DEFAULT_ENV_ALLOWLIST));
-    }
-
-    #[test]
-    fn test_is_dangerous() {
-        assert!(is_dangerous("LD_PRELOAD"));
-        assert!(is_dangerous("LD_LIBRARY_PATH"));
-        assert!(is_dangerous("DYLD_INSERT_LIBRARIES"));
-        assert!(!is_dangerous("HOME"));
-        assert!(!is_dangerous("PATH"));
-    }
-
-    #[test]
-    fn test_hardened_env_extra_allow() {
-        let extra = vec!["DISPLAY".to_string(), "MY_APP_*".to_string()];
-        assert!(env_matches("DISPLAY", &extra));
-        assert!(env_matches("MY_APP_TOKEN", &extra));
-        assert!(!env_matches("OTHER_TOKEN", &extra));
-    }
-}
+mod tests;
