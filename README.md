@@ -19,7 +19,7 @@ nnn init                         # Write default global config
 ```
 
 Config: global (`~/.config/nnn/config.toml`, xdg config directory) + project (`.nnn.toml` in git root).
-Both are just `allow-read` and `allow-write` whitelists, combined at runtime.
+Both are just `allow-read`, `allow-write`, and `allow-env` whitelists, combined at runtime.
 
 Additional CLI arguments `--add-ro`/`--add-rw`, as well as env variables
 `NNN_RO` and `NNN_RW` can be used to add permissions in a more ad-hoc way
@@ -53,12 +53,27 @@ allow-read = ["/bin", "/usr/bin"]
 allow-write = ["/tmp/"]
 seccomp = true            # default, can be overridden per config
 
+# Extra env vars to pass into the sandbox (beyond the built-in defaults)
+# allow-env = ["DISPLAY", "WAYLAND_DISPLAY", "MY_TOKEN", "MY_APP_*"]
+
 [network]
 deny-default = false      # deny all outbound TCP by default, when true
 allow-ports = [80, 443]   # ports allowed when deny-default = true
 ```
 
 CLI: `--allow-port 80,443` appends to the config ports.
+
+### Environment variables
+
+The sandboxed process receives a filtered environment — only a built-in
+whitelist is passed through by default:
+
+> `HOME`, `USER`, `LOGNAME`, `UID`, `PATH`, `SHELL`, `TERM`, `COLORTERM`,
+> `LANG`, `LC_*` (locale), `XDG_*` (all XDG dirs)
+
+`LD_*` / `DYLD_*` are always stripped. Everything else is blocked unless
+explicitly listed in `allow-env`. Patterns ending with `*` match by prefix
+(e.g. `"MY_APP_*"` allows `MY_APP_TOKEN`, `MY_APP_URL`, etc.).
 
 Environment variables (`NNN_RO`, `NNN_RW` — comma-separated paths) are loaded before CLI flags. `NNN_CONFIG` loads an additional TOML file after project config. Compatible with [direnv](https://direnv.net/):
 

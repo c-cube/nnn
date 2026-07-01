@@ -35,9 +35,18 @@ impl NetworkConfig {
 struct Config {
     allow_read: Vec<String>,
     allow_write: Vec<String>,
+    allow_env: Vec<String>,
     /// None = use built-in default (true).
     seccomp: Option<bool>,
     network: NetworkConfig,
+}
+
+fn merge_vec<T: PartialEq + Clone>(dst: &mut Vec<T>, src: &[T]) {
+    for p in src {
+        if !dst.contains(p) {
+            dst.push(p.clone());
+        }
+    }
 }
 
 impl Config {
@@ -47,24 +56,13 @@ impl Config {
 
     fn merge(&self, overlay: &Config) -> Config {
         let mut c = self.clone();
-        for p in &overlay.allow_read {
-            if !c.allow_read.contains(p) {
-                c.allow_read.push(p.clone());
-            }
-        }
-        for p in &overlay.allow_write {
-            if !c.allow_write.contains(p) {
-                c.allow_write.push(p.clone());
-            }
-        }
+        merge_vec(&mut c.allow_read, &overlay.allow_read);
+        merge_vec(&mut c.allow_write, &overlay.allow_write);
+        merge_vec(&mut c.allow_env, &overlay.allow_env);
         c.seccomp = overlay.seccomp.or(c.seccomp);
         c.network.deny_tcp = overlay.network.deny_tcp.or(c.network.deny_tcp);
         c.network.deny_udp = overlay.network.deny_udp.or(c.network.deny_udp);
-        for p in &overlay.network.allow_ports {
-            if !c.network.allow_ports.contains(p) {
-                c.network.allow_ports.push(*p);
-            }
-        }
+        merge_vec(&mut c.network.allow_ports, &overlay.network.allow_ports);
         c
     }
 }
@@ -81,6 +79,12 @@ allow-write = [
     "/tmp/",
     "~/.cargo/",
 ]
+
+# Extra env vars passed into the sandbox.
+# Built-in defaults are always included: HOME, USER, LOGNAME, UID, PATH, SHELL,
+# TERM, COLORTERM, LANG, LC_* (locale), XDG_* (all XDG vars).
+# Patterns ending with * match by prefix (e.g. "MY_APP_*").
+# allow-env = ["DISPLAY", "WAYLAND_DISPLAY", "MY_TOKEN"]
 
 # Network restrictions (Landlock ABI V4+, kernel >= 5.19)
 # [network]
@@ -216,21 +220,9 @@ fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
         cfg.network.deny_tcp = Some(true);
     }
 
-    for p in &args.add_ro {
-        if !cfg.allow_read.contains(p) {
-            cfg.allow_read.push(p.clone());
-        }
-    }
-    for p in &args.add_rw {
-        if !cfg.allow_write.contains(p) {
-            cfg.allow_write.push(p.clone());
-        }
-    }
-    for &p in &args.allow_port {
-        if !cfg.network.allow_ports.contains(&p) {
-            cfg.network.allow_ports.push(p);
-        }
-    }
+    merge_vec(&mut cfg.allow_read, &args.add_ro);
+    merge_vec(&mut cfg.allow_write, &args.add_rw);
+    merge_vec(&mut cfg.network.allow_ports, &args.allow_port);
 
     if !cfg.network.allow_ports.is_empty() && !cfg.network.deny_tcp.unwrap_or(false) {
         log::warn!("allow-ports set without deny-tcp: deny_tcp=true implicitly");
@@ -242,7 +234,7 @@ fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
 
     log::info!("resolved config: {cfg:#?}");
 
-    let env = hardened_env();
+    let env = hardened_env(&cfg.allow_env);
 
     if cfg.seccomp_enabled() {
         seccomp_apply()?;
@@ -335,6 +327,7 @@ fn cmd_show() -> anyhow::Result<()> {
                 println!("\nResolved (merged):");
                 print_paths("allow-read", &merged.allow_read);
                 print_paths("allow-write", &merged.allow_write);
+                print_env_allowlist(&merged.allow_env);
                 print_network(&merged.network);
             }
             Err(e) => eprintln!("  error: {e}"),
@@ -343,9 +336,25 @@ fn cmd_show() -> anyhow::Result<()> {
         println!("\nResolved (global only):");
         print_paths("allow-read", &global_cfg.allow_read);
         print_paths("allow-write", &global_cfg.allow_write);
+        print_env_allowlist(&global_cfg.allow_env);
         print_network(&global_cfg.network);
     }
     Ok(())
+}
+
+fn print_env_allowlist(extra: &[String]) {
+    let print_inline = |label: &str, items: &[&str]| {
+        print!("  {label}:");
+        for p in items {
+            print!(" {p}");
+        }
+        println!();
+    };
+    print_inline("allow-env (built-in)", DEFAULT_ENV_ALLOWLIST);
+    if !extra.is_empty() {
+        let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+        print_inline("allow-env (config)", &extra_refs);
+    }
 }
 
 fn print_network(net: &NetworkConfig) {
@@ -520,6 +529,8 @@ fn load_toml_file(path: &Path) -> anyhow::Result<Config> {
         #[serde(default)]
         allow_write: Vec<String>,
         #[serde(default)]
+        allow_env: Vec<String>,
+        #[serde(default)]
         seccomp: Option<bool>,
         #[serde(default)]
         network: Option<NetworkRaw>,
@@ -547,6 +558,7 @@ fn load_toml_file(path: &Path) -> anyhow::Result<Config> {
     Ok(Config {
         allow_read: raw.allow_read,
         allow_write: raw.allow_write,
+        allow_env: raw.allow_env,
         seccomp: raw.seccomp,
         network,
     })
@@ -566,9 +578,39 @@ fn config_dir() -> PathBuf {
 
 // ── Environment sanitization ──
 
-fn hardened_env() -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> =
-        std::env::vars().filter(|(k, _)| !is_dangerous(k)).collect();
+const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "UID",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "COLORTERM",
+    "LANG",
+    "LC_*",  // prefix: LC_ALL, LC_CTYPE, LC_MESSAGES, etc.
+    "XDG_*", // prefix: all XDG vars (XDG_RUNTIME_DIR, XDG_CONFIG_HOME, etc.)
+];
+
+fn env_matches<S: AsRef<str>>(key: &str, patterns: &[S]) -> bool {
+    patterns.iter().any(|pat| {
+        let pat = pat.as_ref();
+        if let Some(prefix) = pat.strip_suffix('*') {
+            key.starts_with(prefix)
+        } else {
+            key == pat
+        }
+    })
+}
+
+fn hardened_env(extra_allow: &[String]) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| {
+            k != "NNN"
+                && !is_dangerous(k)
+                && (env_matches(k, DEFAULT_ENV_ALLOWLIST) || env_matches(k, extra_allow))
+        })
+        .collect();
     env.push(("NNN".to_string(), "1".to_string()));
     env
 }
@@ -858,5 +900,48 @@ fn landlock_add_rule(
         Err(e) => {
             bail!("landlock: add_rule failed for {path}: {e}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_env_matches_exact() {
+        assert!(env_matches("HOME", DEFAULT_ENV_ALLOWLIST));
+        assert!(env_matches("PATH", DEFAULT_ENV_ALLOWLIST));
+        assert!(env_matches("LANG", DEFAULT_ENV_ALLOWLIST));
+        assert!(!env_matches("AWS_SECRET_KEY", DEFAULT_ENV_ALLOWLIST));
+        assert!(!env_matches("GITHUB_TOKEN", DEFAULT_ENV_ALLOWLIST));
+        assert!(!env_matches("LD_PRELOAD", DEFAULT_ENV_ALLOWLIST));
+    }
+
+    #[test]
+    fn test_env_matches_prefix() {
+        assert!(env_matches("LC_ALL", DEFAULT_ENV_ALLOWLIST));
+        assert!(env_matches("LC_CTYPE", DEFAULT_ENV_ALLOWLIST));
+        assert!(env_matches("XDG_RUNTIME_DIR", DEFAULT_ENV_ALLOWLIST));
+        assert!(env_matches("XDG_CONFIG_HOME", DEFAULT_ENV_ALLOWLIST));
+        assert!(env_matches("XDG_DATA_HOME", DEFAULT_ENV_ALLOWLIST));
+        // "LC" without underscore should not match "LC_*" prefix
+        assert!(!env_matches("LC", DEFAULT_ENV_ALLOWLIST));
+    }
+
+    #[test]
+    fn test_is_dangerous() {
+        assert!(is_dangerous("LD_PRELOAD"));
+        assert!(is_dangerous("LD_LIBRARY_PATH"));
+        assert!(is_dangerous("DYLD_INSERT_LIBRARIES"));
+        assert!(!is_dangerous("HOME"));
+        assert!(!is_dangerous("PATH"));
+    }
+
+    #[test]
+    fn test_hardened_env_extra_allow() {
+        let extra = vec!["DISPLAY".to_string(), "MY_APP_*".to_string()];
+        assert!(env_matches("DISPLAY", &extra));
+        assert!(env_matches("MY_APP_TOKEN", &extra));
+        assert!(!env_matches("OTHER_TOKEN", &extra));
     }
 }
