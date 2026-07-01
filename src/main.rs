@@ -501,9 +501,8 @@ fn trust_store_path() -> PathBuf {
 }
 
 fn hash_file_hex(path: &Path) -> anyhow::Result<String> {
-    use sha2::{Digest, Sha256};
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(&data)))
+    Ok(blake3::hash(&data).to_string())
 }
 
 fn trust_key(path: &Path) -> anyhow::Result<String> {
