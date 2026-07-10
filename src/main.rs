@@ -76,7 +76,7 @@ const DEFAULT_CONFIG: &str = r#"allow-read = [
 ]
 
 allow-write = [
-    "/tmp/",
+    "/tmp/nnn/",
     "~/.cargo/",
 ]
 
@@ -792,10 +792,10 @@ fn seccomp_apply() -> anyhow::Result<()> {
 
 const SYSTEM_READ_PATHS: &[&str] = &[
     "/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc", "/proc", "/sys", "/run", "/var",
-    "/opt", "/dev", "/tmp",
+    "/opt", "/dev",
 ];
 
-const SYSTEM_WRITE_PATHS: &[&str] = &["/dev/null", "/dev/tty", "/tmp", "/var/tmp"];
+const SYSTEM_WRITE_PATHS: &[&str] = &["/dev/null", "/dev/tty"];
 
 fn landlock_access_read() -> landlock::BitFlags<AccessFs> {
     make_bitflags!(AccessFs::{Execute | ReadFile | ReadDir})
