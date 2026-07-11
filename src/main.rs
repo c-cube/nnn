@@ -677,6 +677,11 @@ const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
     "XDG_*", // prefix: all XDG vars (XDG_RUNTIME_DIR, XDG_CONFIG_HOME, etc.)
 ];
 
+// Injected into sandboxed environment. TMPDIR is a widely-used convention
+// (Python tempfile, Go, GCC, cargo, etc.). Pointing it at a write-allowed
+// path prevents temp-file leakage into unmonitored directories.
+const INJECTED_ENV: &[(&str, &str)] = &[("NNN", "1"), ("TMPDIR", "/tmp/nnn")];
+
 fn env_matches<S: AsRef<str>>(key: &str, patterns: &[S]) -> bool {
     patterns.iter().any(|pat| {
         let pat = pat.as_ref();
@@ -696,7 +701,9 @@ fn hardened_env(extra_allow: &[String]) -> Vec<(String, String)> {
                 && (env_matches(k, DEFAULT_ENV_ALLOWLIST) || env_matches(k, extra_allow))
         })
         .collect();
-    env.push(("NNN".to_string(), "1".to_string()));
+    for (k, v) in INJECTED_ENV {
+        env.push((k.to_string(), v.to_string()));
+    }
     env
 }
 
