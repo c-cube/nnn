@@ -388,6 +388,11 @@ fn cmd_init() -> anyhow::Result<()> {
         anyhow::bail!("{} already exists", path.display());
     }
 
+    // Create /tmp/nnn as the sandbox temporary directory (used by INJECTED_ENV
+    // and the default config's allow-write list). Failure is non-fatal — the
+    // sandbox will still work, the user just needs to create it manually.
+    let _ = std::fs::create_dir_all("/tmp/nnn");
+
     std::fs::write(&path, DEFAULT_CONFIG).with_context(|| format!("writing {}", path.display()))?;
 
     println!("wrote {}", path.display());
