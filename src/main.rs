@@ -388,10 +388,8 @@ fn cmd_init() -> anyhow::Result<()> {
         anyhow::bail!("{} already exists", path.display());
     }
 
-    // Create /tmp/nnn as the sandbox temporary directory (used by INJECTED_ENV
-    // and the default config's allow-write list). Failure is non-fatal — the
-    // sandbox will still work, the user just needs to create it manually.
-    let _ = std::fs::create_dir_all("/tmp/nnn");
+    // Try to create /tmp/nnn as the sandbox temporary directory (used by INJECTED_ENV).
+    let _ = std::fs::create_dir_all(TMPDIR);
 
     std::fs::write(&path, DEFAULT_CONFIG).with_context(|| format!("writing {}", path.display()))?;
 
@@ -682,10 +680,12 @@ const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
     "XDG_*", // prefix: all XDG vars (XDG_RUNTIME_DIR, XDG_CONFIG_HOME, etc.)
 ];
 
+const TMPDIR: &str = "/tmp/nnn";
+
 // Injected into sandboxed environment. TMPDIR is a widely-used convention
 // (Python tempfile, Go, GCC, cargo, etc.). Pointing it at a write-allowed
 // path prevents temp-file leakage into unmonitored directories.
-const INJECTED_ENV: &[(&str, &str)] = &[("NNN", "1"), ("TMPDIR", "/tmp/nnn")];
+const INJECTED_ENV: &[(&str, &str)] = &[("NNN", "1"), ("TMPDIR", TMPDIR)];
 
 fn env_matches<S: AsRef<str>>(key: &str, patterns: &[S]) -> bool {
     patterns.iter().any(|pat| {
