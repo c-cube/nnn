@@ -4,11 +4,10 @@
 #![deny(clippy::expect_used)]
 
 use anyhow::{bail, Context};
-use landlock::{
-    make_bitflags, Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, ABI,
-};
+use landlock::{make_bitflags, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetStatus, ABI};
 use std::path::{Path, PathBuf};
+
+mod landlock_raw;
 
 use clap::{Parser, Subcommand};
 use toml_edit::DocumentMut;
@@ -847,108 +846,21 @@ fn landlock_available() -> bool {
 }
 
 fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
-    let abi = ABI::V5;
+    let read_paths: Vec<String> = config.allow_read.iter().map(|p| expand_tilde(p)).collect();
+    let write_paths: Vec<String> = config.allow_write.iter().map(|p| expand_tilde(p)).collect();
 
-    let fs_access = AccessFs::from_all(abi);
-    if fs_access.is_empty() {
-        log::error!(
-            "landlock: not supported on this kernel (ABI {abi:?} returned empty access set)"
-        );
-        anyhow::bail!("landlock not supported on this kernel (need Linux >= 5.19 for ABI V5, or check CONFIG_SECCOMP_FILTER in kernel)");
-    }
+    let system_read: Vec<&str> = SYSTEM_READ_PATHS.to_vec();
+    let system_write: Vec<&str> = SYSTEM_WRITE_PATHS.to_vec();
 
-    let deny_tcp = config.network.is_deny_tcp();
-    let deny_udp = config.network.is_deny_udp();
-    let net_restricted = deny_tcp || deny_udp || !config.network.allow_ports.is_empty();
-
-    if deny_udp {
-        log::warn!("landlock: deny-udp requires AccessNet::ConnectUdp which is not available in landlock 0.4 — ignored");
-    }
-
-    let mut ruleset = Ruleset::default().handle_access(fs_access).map_err(|e| {
-        anyhow::anyhow!("landlock: kernel rejected access rights (need Linux >= 5.19, ABI V5): {e}")
-    })?;
-
-    if net_restricted {
-        let net_access = AccessNet::from_all(abi);
-        let handle = make_bitflags!(AccessNet::{BindTcp | ConnectTcp});
-        if !net_access.intersects(handle) {
-            anyhow::bail!(
-                "landlock: network restrictions require Landlock ABI V4+ (kernel >= 5.19)"
-            );
-        }
-        ruleset = ruleset.handle_access(handle).map_err(|e| {
-            anyhow::anyhow!(
-                "landlock: kernel rejected net access rights (need Linux >= 5.19, ABI V4+): {e}"
-            )
-        })?;
-    }
-
-    let mut ruleset = ruleset.create().map_err(|e| {
-        anyhow::anyhow!(
-            "landlock: ruleset creation failed (check Landlock ABI support in kernel config): {e}"
-        )
-    })?;
-
-    for path in SYSTEM_READ_PATHS {
-        ruleset = landlock_add_rule(ruleset, path, landlock_access_read())
-            .with_context(|| format!("adding read rule for {path}"))?;
-    }
-
-    for path in SYSTEM_WRITE_PATHS {
-        ruleset = landlock_add_rule(ruleset, path, landlock_access_write(abi))
-            .with_context(|| format!("adding write rule for {path}"))?;
-    }
-
-    if auto_cwd {
-        if let Ok(cwd) = std::env::current_dir() {
-            let cwd_str = cwd.to_string_lossy().to_string();
-            ruleset = landlock_add_rule(ruleset, &cwd_str, landlock_access_write(abi))
-                .context("adding cwd rule")?;
-        }
-    }
-
-    for p in &config.allow_read {
-        let expanded = expand_tilde(p);
-        ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_read())
-            .with_context(|| format!("adding read rule for {p}"))?;
-    }
-
-    for p in &config.allow_write {
-        let expanded = expand_tilde(p);
-        ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_write(abi))
-            .with_context(|| format!("adding write rule for {p}"))?;
-    }
-
-    if net_restricted {
-        for &port in &config.network.allow_ports {
-            let rule = NetPort::new(port, AccessNet::ConnectTcp);
-            match ruleset.add_rule(rule) {
-                Ok(rs) => {
-                    log::debug!("landlock: allow ConnectTcp port {port}");
-                    ruleset = rs;
-                }
-                Err(e) => {
-                    bail!("landlock: failed to add net port {port}: {e}")
-                }
-            }
-        }
-    }
-
-    let status = ruleset
-        .restrict_self()
-        .context("landlock: restrict_self failed (process lacks CAP_SYS_ADMIN or Landlock not enabled in kernel)")?;
-    if status.ruleset != RulesetStatus::FullyEnforced {
-        anyhow::bail!(
-            "Landlock restrictions not enforced: ruleset={:?}, landlock={:?} \
-             (kernel too old or Landlock not enabled in kernel)",
-            status.ruleset,
-            status.landlock,
-        );
-    }
-
-    log::info!("landlock: restrictions applied");
-    Ok(())
+    landlock_raw::apply(
+        &read_paths,
+        &write_paths,
+        &config.network.allow_ports,
+        config.network.is_deny_tcp(),
+        auto_cwd,
+        &system_read,
+        &system_write,
+    )
 }
 
 // Access bits that are valid only for file FDs, not dirs
