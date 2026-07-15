@@ -675,6 +675,7 @@ const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
     "SHELL",
     "TERM",
     "COLORTERM",
+    "EDITOR",
     "LANG",
     "LC_*",  // prefix: LC_ALL, LC_CTYPE, LC_MESSAGES, etc.
     "XDG_*", // prefix: all XDG vars (XDG_RUNTIME_DIR, XDG_CONFIG_HOME, etc.)
