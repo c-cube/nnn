@@ -200,6 +200,12 @@ fn main() {
 fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
+    // Create sandbox temp directory before Landlock restricts filesystem access,
+    // so the TMPDIR injected into the child environment actually exists.
+    if let Err(e) = std::fs::create_dir_all(Path::new(TMPDIR)) {
+        log::warn!("failed to create {TMPDIR}: {e}");
+    }
+
     let mut cfg = resolve_config(args.project_config.as_deref())?;
 
     // NNN_CONFIG: additional config file
@@ -387,9 +393,6 @@ fn cmd_init() -> anyhow::Result<()> {
     if path.exists() {
         anyhow::bail!("{} already exists", path.display());
     }
-
-    // Try to create /tmp/nnn as the sandbox temporary directory (used by INJECTED_ENV).
-    let _ = std::fs::create_dir_all(TMPDIR);
 
     std::fs::write(&path, DEFAULT_CONFIG).with_context(|| format!("writing {}", path.display()))?;
 
