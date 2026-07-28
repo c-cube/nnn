@@ -28,6 +28,7 @@ fn run_nnn(
     cmd.env_remove("NNN_CONFIG");
     cmd.env_remove("NNN_RO");
     cmd.env_remove("NNN_RW");
+    cmd.env_remove("NNN_ALLOW_ENV");
     let output = cmd.output().expect("failed to run nnn");
     (
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -163,6 +164,27 @@ fn test_show_with_project_config() {
     assert!(
         stdout.contains("Resolved (merged)"),
         "should show merged: {stdout}"
+    );
+}
+
+#[test]
+fn test_show_with_allow_env_config() {
+    let td = TestDir::new();
+    td.write_global_cfg(
+        r#"allow-env = ["DISPLAY", "WAYLAND_DISPLAY", "MY_APP_*"]
+"#,
+    );
+
+    let (stdout, stderr, status) = run_nnn(&["show"], td.project(), td.xdg_home());
+    assert!(status.success(), "show should succeed: stderr={stderr}");
+    assert!(
+        stdout.contains("allow-env (config)"),
+        "should mention extra env vars: {stdout}"
+    );
+    assert!(stdout.contains("DISPLAY"), "should show DISPLAY: {stdout}");
+    assert!(
+        stdout.contains("MY_APP_*"),
+        "should show MY_APP_*: {stdout}"
     );
 }
 

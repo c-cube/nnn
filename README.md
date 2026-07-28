@@ -82,12 +82,13 @@ whitelist is passed through by default:
 explicitly listed in `allow-env`. Patterns ending with `*` match by prefix
 (e.g. `"MY_APP_*"` allows `MY_APP_TOKEN`, `MY_APP_URL`, etc.).
 
-Environment variables (`NNN_RO`, `NNN_RW` — comma-separated paths) are loaded before CLI flags. `NNN_CONFIG` loads an additional TOML file after project config. Compatible with [direnv](https://direnv.net/):
+Environment variables (`NNN_RO`, `NNN_RW`: comma-separated paths; `NNN_ALLOW_ENV`: comma-separated env var names/patterns) are loaded before CLI flags. `NNN_CONFIG` loads an additional TOML file after project config. Compatible with [direnv](https://direnv.net/):
 
 ```env
 # .envrc
 export NNN_RO="$HOME/src"
 export NNN_RW="$HOME/output"
+export NNN_ALLOW_ENV="DISPLAY,WAYLAND_DISPLAY,API_KEY"
 ```
 
 ## Limitations

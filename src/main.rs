@@ -467,6 +467,14 @@ fn env_overrides() -> Config {
             cfg.network.deny_udp = Some(true);
         }
     }
+    if let Ok(val) = std::env::var("NNN_ALLOW_ENV") {
+        for p in val.split(',') {
+            let p = p.trim().to_string();
+            if !p.is_empty() && !cfg.allow_env.contains(&p) {
+                cfg.allow_env.push(p);
+            }
+        }
+    }
     cfg
 }
 
