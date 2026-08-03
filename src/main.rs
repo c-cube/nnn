@@ -821,25 +821,19 @@ const SYSTEM_READ_PATHS: &[&str] = &[
 
 const SYSTEM_WRITE_PATHS: &[&str] = &["/dev/null", "/dev/tty"];
 
-fn landlock_access_read() -> landlock::BitFlags<AccessFs> {
-    make_bitflags!(AccessFs::{Execute | ReadFile | ReadDir})
+fn landlock_access_read(abi: ABI) -> landlock::BitFlags<AccessFs> {
+    AccessFs::from_read(abi)
 }
 
 fn landlock_access_write(abi: ABI) -> landlock::BitFlags<AccessFs> {
-    let mut flags = make_bitflags!(
-        AccessFs::{Execute | ReadFile | ReadDir | WriteFile | RemoveDir | RemoveFile | MakeChar | MakeDir | MakeReg | MakeSock | MakeFifo | MakeBlock | MakeSym}
-    );
-    if AccessFs::from_all(abi).contains(AccessFs::Refer) {
-        flags |= AccessFs::Refer;
-    }
-    if AccessFs::from_all(abi).contains(AccessFs::Truncate) {
-        flags |= AccessFs::Truncate;
-    }
-    flags
+    // nnn's "allow-write" means full read+write access to the path:
+    // AccessFs::from_write() is write-only (no ReadDir/ReadFile/Execute),
+    // so a write-only rule would make `ls`/`cat` fail inside writable dirs.
+    AccessFs::from_all(abi)
 }
 
 fn landlock_available() -> bool {
-    let abi = ABI::V5;
+    let abi = ABI::V1;
     let fs_access = AccessFs::from_all(abi);
     if fs_access.is_empty() {
         return false;
@@ -858,15 +852,8 @@ fn landlock_available() -> bool {
 }
 
 fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
-    let abi = ABI::V5;
-
+    let abi = ABI::V9;
     let fs_access = AccessFs::from_all(abi);
-    if fs_access.is_empty() {
-        log::error!(
-            "landlock: not supported on this kernel (ABI {abi:?} returned empty access set)"
-        );
-        anyhow::bail!("landlock not supported on this kernel (need Linux >= 5.19 for ABI V5, or check CONFIG_SECCOMP_FILTER in kernel)");
-    }
 
     let deny_tcp = config.network.is_deny_tcp();
     let deny_udp = config.network.is_deny_udp();
@@ -877,7 +864,9 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
     }
 
     let mut ruleset = Ruleset::default().handle_access(fs_access).map_err(|e| {
-        anyhow::anyhow!("landlock: kernel rejected access rights (need Linux >= 5.19, ABI V5): {e}")
+        anyhow::anyhow!(
+            "landlock: kernel rejected access rights (need Linux >= 5.19, ABI V4+): {e}"
+        )
     })?;
 
     if net_restricted {
@@ -902,7 +891,7 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
     })?;
 
     for path in SYSTEM_READ_PATHS {
-        ruleset = landlock_add_rule(ruleset, path, landlock_access_read())
+        ruleset = landlock_add_rule(ruleset, path, landlock_access_read(abi))
             .with_context(|| format!("adding read rule for {path}"))?;
     }
 
@@ -921,7 +910,7 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
 
     for p in &config.allow_read {
         let expanded = expand_tilde(p);
-        ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_read())
+        ruleset = landlock_add_rule(ruleset, &expanded, landlock_access_read(abi))
             .with_context(|| format!("adding read rule for {p}"))?;
     }
 
@@ -949,11 +938,18 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
     let status = ruleset
         .restrict_self()
         .context("landlock: restrict_self failed (process lacks CAP_SYS_ADMIN or Landlock not enabled in kernel)")?;
-    if status.ruleset != RulesetStatus::FullyEnforced {
+    if status.ruleset == RulesetStatus::NotEnforced {
         anyhow::bail!(
             "Landlock restrictions not enforced: ruleset={:?}, landlock={:?} \
              (kernel too old or Landlock not enabled in kernel)",
             status.ruleset,
+            status.landlock,
+        );
+    }
+    if status.ruleset == RulesetStatus::PartiallyEnforced {
+        log::warn!(
+            "landlock: partially enforced (kernel ABI {:?} < requested V9) — access rights \
+             newer than the kernel's ABI (e.g. ResolveUnix) are not enforced",
             status.landlock,
         );
     }
@@ -964,7 +960,7 @@ fn landlock_apply(config: &Config, auto_cwd: bool) -> anyhow::Result<()> {
 
 // Access bits that are valid only for file FDs, not dirs
 const FILE_ACCESS: landlock::BitFlags<AccessFs> = make_bitflags!(AccessFs::{
-    ReadFile | WriteFile | Execute | Truncate | IoctlDev
+    ReadFile | WriteFile | Execute | Truncate | IoctlDev | ResolveUnix
 });
 
 fn landlock_add_rule(

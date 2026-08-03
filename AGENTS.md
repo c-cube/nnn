@@ -170,10 +170,11 @@ Rust CI — `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test`.
 - `add_rule` failure returns error (no panic). The `RulesetCreated`
   builder consumes self on `add_rule`, so the ruleset is lost on failure.
 - Proc symlinks (`/dev/stdout`, `/dev/stderr` → `/proc/self/fd/*`) are
-  silently skipped — Landlock rejects path references pointing into proc.
+  silently skipped: Landlock rejects path references pointing into proc.
 - Landlock cannot deny reads within an allowed directory tree (the kernel
   limitation, not nnn's).
-- `ABI::V5` is hardcoded — may fail on kernels < 5.19. No runtime ABI
-  detection or fallback.
+- `ABI::V9` is hardcoded. On kernels with an older Landlock ABI, unsupported
+  access rights (e.g. `ResolveUnix`) are silently dropped and `nnn` logs a
+  "partially enforced" warning.
 - Network restriction only covers TCP connect (Landlock ABI V4+). UDP is
   unrestricted.
